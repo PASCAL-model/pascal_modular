@@ -17,12 +17,20 @@ overlays config['biology'] via build_global_settings_from_config).
 
 import datetime as dt
 import os
+from pathlib import Path
 
 import numpy as np
 
 from pascal.coupler import DEFAULT_DEPTHRANGE
 
 PROFILE_VARS = ["temperature", "food1concentration", "irradiance", "pred1dens"]
+
+# A20 ROMS/ECOSMO output variable -> file name, one variable per file (see
+# build_a20_advection_scenario()). u_eastward/v_northward already carry
+# standard_names identifying them as earth-relative (not grid-relative)
+# velocity, so reader_ROMS_native skips rotation automatically - no grid
+# "angle" needed, unlike native ROMS u/v.
+A20_HIS_VARS = ["temp", "salt", "u_eastward", "v_northward", "w", "AKs", "zeta"]
 
 
 def compute_total_tsteps(start_date, duration_years, timestep, isplit=1):
@@ -408,6 +416,224 @@ def build_cmems_advection_scenario_from_file(
         "nvindividualspersupindividual": n_virtual_per_super,
         "global_settings": build_global_settings(stochastic=stochastic),
         "reader": [physical, constants],
+        "timestep": timestep,
+        "start_date": start_date,
+        "duration": duration_years,
+        "seeding_rate": seeding_rate,
+        "start_locations": [[lon, lat]],
+        "outputgrid": outputgrid,
+        "tracker_config": {
+            "general:use_auto_landmask": True,
+            "vertical_mixing:diffusivitymodel": "windspeed_Sundby1983",
+        },
+        "headless": headless,
+    }
+
+
+def _inject_a20_grid_placeholders(ds):
+    """The A20 ROMS/ECOSMO output ships one variable per file, none of
+    which carry the grid metadata (mask_rho, Vtransform, ...) that
+    normally lives in a separate ROMS grid file (HPC-only, not shipped
+    alongside the netCDF output - see reduced_temp.nc's grd_file global
+    attribute in a real extract). Synthesize the minimum
+    reader_ROMS_native.Reader needs to run at all:
+
+    - mask_rho = all-ones (all water). Real simplification, not just a
+      stand-in for a missing attribute: land cells still come back NaN in
+      the actual variable data (ROMS's own _FillValue masking, decoded by
+      xarray automatically), so a particle sitting on real land still gets
+      missing environment data. But OpenDrift's own coastline detection
+      (general:coastline_action, land_binary_mask) will never trigger,
+      since it only looks at this synthetic mask.
+    - Vtransform = 2, matching s_rho's declared standard_name
+      "ocean_s_coordinate_g2" (CF convention: _g1 <-> Vtransform=1, _g2 <->
+      Vtransform=2). Without this reader_ROMS_native defaults silently to
+      Vtransform=1, which would compute the wrong physical depth for every
+      sigma layer. Confirmed against a real A20 ROMS config (a20_v3y.in:
+      Vtransform == 2, Vstretching == 2, THETA_S == 6.0, THETA_B == 0.1,
+      TCLINE/hc == 100.0, N == 35).
+    """
+    import xarray as xr
+
+    ds = ds.copy()
+    ds["mask_rho"] = xr.DataArray(
+        np.ones(ds["lat_rho"].shape, dtype=np.float64), dims=ds["lat_rho"].dims
+    )
+    ds["Vtransform"] = xr.DataArray(2)
+    return ds
+
+
+def _build_a20_food_reader(data_dir, food_variable):
+    """food1concentration as its own reader, on the diagnostic (dia) A20
+    output group's own native daily-noon axis - see
+    build_a20_advection_scenario() for why this is a separate reader
+    rather than being merged into the physical (his) one."""
+    import xarray as xr
+
+    from opendrift.readers.reader_ROMS_native import Reader as ROMSReader
+
+    dia = xr.open_dataset(data_dir / f"reduced_{food_variable}.nc", decode_times=False,
+                          chunks={"ocean_time": 1})
+    # dia has no zeta of its own - Reader.zeta then falls back to a static
+    # 2D all-zero array with no time dimension, and any non-surface (z !=
+    # 0) request raises IndexError. Borrow zeta from the his group's file,
+    # reindexed onto dia's own (noon) ocean_time axis. dia also lacks
+    # hc/Cs_r/h entirely (only s_rho, time-invariant so copied as-is) -
+    # Reader.get_variables() needs all four for any non-surface request.
+    temp_ds = xr.open_dataset(data_dir / "reduced_temp.nc", decode_times=False,
+                              chunks={"ocean_time": 1})
+    zeta_ds = xr.open_dataset(data_dir / "reduced_zeta.nc", decode_times=False,
+                              chunks={"ocean_time": 1})
+    dia["zeta"] = zeta_ds["zeta"].reindex(ocean_time=dia["ocean_time"], method="nearest")
+    dia["hc"] = temp_ds["hc"]
+    dia["Cs_r"] = temp_ds["Cs_r"]
+    dia["h"] = temp_ds["h"]
+    dia = _inject_a20_grid_placeholders(dia)
+    return ROMSReader(
+        filename=dia, name="a20_food",
+        standard_name_mapping={food_variable: "food1concentration"},
+    )
+
+
+def _build_a20_swrad_reader(data_dir):
+    """irradiance as its own reader, on the quicksave (qck) A20 output
+    group's own native hourly axis - recovers the real diurnal cycle. This
+    file typically only covers part of a longer run's total duration (the
+    real 25-year archive's qck files may have fuller coverage than a
+    reduced test extract); discard_reader_if_not_relevant() drops this
+    reader once its end_time is passed, and irradiance correctly reverts to
+    the environment:fallback:irradiance constant for the rest of the run."""
+    import xarray as xr
+
+    from opendrift.readers.reader_ROMS_native import Reader as ROMSReader
+
+    qck = xr.open_dataset(data_dir / "reduced_swrad.nc", decode_times=False,
+                           chunks={"ocean_time": 1})
+    zeta_ds = xr.open_dataset(data_dir / "reduced_zeta.nc", decode_times=False,
+                               chunks={"ocean_time": 1})
+    h_ds = xr.open_dataset(data_dir / "reduced_temp.nc", decode_times=False,
+                            chunks={"ocean_time": 1})
+    # swrad is genuinely 2D (surface-only, no s_rho) and carries neither
+    # zeta nor h of its own - both needed by reader_ROMS_native's depth
+    # machinery for any non-surface (z != 0) request, which is what PASCAL
+    # always issues since irradiance is a depth profile variable.
+    qck["zeta"] = zeta_ds["zeta"].reindex(ocean_time=qck["ocean_time"], method="nearest")
+    qck["h"] = h_ds["h"]
+    qck = _inject_a20_grid_placeholders(qck)
+    qck_reader = ROMSReader(filename=qck, name="a20_swrad",
+                             standard_name_mapping={"swrad": "irradiance"})
+    # Monkeypatch a single sigma layer at the surface (hc=0, Cs_r=[0]) so
+    # get_variables() takes its normal 3D code path instead of crashing on
+    # a missing self.hc for any z != 0 request - makes irradiance depth
+    # constant (ROMS quicksave output has no attenuation profile to give it
+    # real depth structure, same simplification as the CMEMS scenarios'
+    # irradiance constant above).
+    qck_reader.hc = np.array(0.0)
+    qck_reader.Cs_r = np.array([0.0])
+    qck_reader.sigma = np.array([0.0])
+    qck_reader.num_layers = 1
+    return qck_reader
+
+
+def build_a20_readers(data_dir, food_variable="Chl_bc"):
+    """The reader stack for a real A20 ROMS/ECOSMO run: physical variables
+    (temperature/salinity/velocities/vertical diffusivity/depth/synthetic
+    land mask) from the history (his) output group; food1concentration
+    from its own diagnostic (dia) reader, on its own native noon-offset
+    axis; irradiance from its own quicksave (qck) reader, on its own native
+    hourly axis; and a ConstantReader for the variables ROMS has no
+    equivalent for (pred1dens/pred1lightdep/mld - same gap the CMEMS
+    scenarios above already have).
+
+    food1concentration/irradiance each being their own reader (rather than
+    being reindexed onto his's axis and merged into one reader) only works
+    correctly with the opendrift fork's fix for a multi-reader-group
+    profile-variable bug (a later reader group's new profile variable used
+    to be silently dropped and replaced by PASCAL's fallback constant - see
+    build_cmems_advection_scenario()'s docstring for the same bug's effect
+    on pred1dens there).
+
+    data_dir must contain one ROMS output variable per file, named
+    reduced_<var>.nc (temp, salt, u_eastward, v_northward, w, AKs, zeta,
+    <food_variable>, swrad) - the convention used by the A20 test extract.
+    """
+    from opendrift.readers.reader_constant import Reader as ConstantReader
+    from opendrift.readers.reader_ROMS_native import Reader as ROMSReader
+    import xarray as xr
+
+    data_dir = Path(data_dir)
+
+    his = xr.merge(
+        [xr.open_dataset(data_dir / f"reduced_{v}.nc", decode_times=False,
+                          chunks={"ocean_time": 1}) for v in A20_HIS_VARS],
+        compat="override", join="exact",
+    )
+    his = _inject_a20_grid_placeholders(his)
+    physical_reader = ROMSReader(
+        filename=his, name="a20_physical",
+        standard_name_mapping={"temp": "temperature"},
+    )
+
+    return [physical_reader, _build_a20_food_reader(data_dir, food_variable),
+            _build_a20_swrad_reader(data_dir),
+            ConstantReader({
+                "pred1dens": 0.00001,
+                "pred1lightdep": 0.1,
+                "mld": 30,
+            })]
+
+
+def build_a20_advection_scenario(
+    data_dir,
+    n_super_individuals=50,
+    n_virtual_per_super=10000,
+    duration_years=0.05,
+    timestep_seconds=21600,
+    seeding_rate=10,
+    stochastic=True,
+    seed=0,
+    start_date=None,
+    start_location=(14.7, 69.53),
+    food_variable="Chl_bc",
+    headless="bench_run",
+):
+    """Return kwargs ready to pass to coupler.PascalAdvection(**kwargs),
+    backed by real A20 ROMS/ECOSMO output (data_dir - see build_a20_readers()
+    for the expected file layout) instead of a synthetic reader.
+
+    Promoted from a20_test/roms_readers.py + run_a20_test.py (a standalone
+    script predating this repo split) into a real, reusable scenario
+    builder alongside the CMEMS ones above - see that directory's
+    README.md for the full investigation (three ROMS-reader bugs worked
+    around here, plus the multi-reader-group profile bug shared with
+    build_cmems_advection_scenario()) this was built from.
+
+    start_location defaults to a point roughly mid-domain, matching the
+    CMEMS scenarios' Lofoten/Vestfjorden test point - the A20 grid covers
+    this area. start_date defaults to one day after the A20 test extract's
+    own start time (1995-01-24), since asking for data before a reader's
+    start_time raises.
+    """
+    np.random.seed(seed)
+
+    data_dir = Path(data_dir)
+    readers = build_a20_readers(data_dir, food_variable=food_variable)
+
+    timestep = dt.timedelta(seconds=timestep_seconds)
+    if start_date is None:
+        start_date = dt.datetime(1995, 1, 25)
+
+    lon, lat = start_location
+    outputgrid = {
+        "lon": [lon - 1, lon, lon + 1, lon + 2],
+        "lat": [lat - 1, lat, lat + 1],
+    }
+
+    return {
+        "nsupindividuals": n_super_individuals,
+        "nvindividualspersupindividual": n_virtual_per_super,
+        "global_settings": build_global_settings(stochastic=stochastic),
+        "reader": readers,
         "timestep": timestep,
         "start_date": start_date,
         "duration": duration_years,
