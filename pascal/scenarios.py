@@ -237,6 +237,8 @@ def build_cmems_advection_scenario(
     food1concentration_constant=0.05,
     pred1dens_constant=0.00001,
     irradiance_constant=0.1,
+    pred_data_dir=None,
+    pred_variable="vpdens",
     headless="bench_run",
 ):
     """Return kwargs ready to pass to coupler.PascalAdvection(**kwargs),
@@ -308,17 +310,28 @@ def build_cmems_advection_scenario(
     irradiance/pred1dens have no CMEMS equivalent at all. pred1dens now
     has a real (non-CMEMS) source - see pascal.scenarios::
     build_pred1dens_readers(), real visual-predator-density fields
-    covering 1995-1997 (a20_test/pred_data) - already wired into
-    build_a20_advection_scenario() but not into this CMEMS scenario;
-    doing so is a reasonable follow-up given the two share a domain
-    (a20_test/pred_data's grid covers this scenario's default
-    start_location) but hasn't been done. irradiance needs a real
-    derivation from a surface radiation product (e.g. ERA5 via the
-    Copernicus Climate Data Store), not yet integrated. Both (plus
-    food1concentration) are given as constants here as an explicit
-    stand-in, using the same values already proven not to cause the
-    population collapse a food1concentration=0 fallback does (see
-    build_advection_scenario()).
+    covering 1995-1997 (a20_test/pred_data), whose domain (lat 65-76N,
+    lon 5-20E) covers this scenario's default start_location too.
+
+    UPDATE 2026-09-16: wired in, same optional pattern as
+    build_a20_advection_scenario() - pass pred_data_dir (and optionally
+    pred_variable, default "vpdens") to use real pred1dens data instead
+    of the flat pred1dens_constant fallback; the real readers, when
+    given, are placed before the ConstantReader in the reader list, so
+    they take priority for whichever years they cover (1995-1997) and
+    the constant only fills in outside that range - the CMEMS physical
+    product's own coverage (2024-onward for the live reader; whatever a
+    downloaded file covers for _from_file()) won't overlap
+    a20_test/pred_data's years, so in practice this currently just
+    keeps the constant behavior unless pred_data_dir points at a
+    dataset that does cover the run's actual dates.
+
+    irradiance needs a real derivation from a surface radiation product
+    (e.g. ERA5 via the Copernicus Climate Data Store), not yet
+    integrated. Both irradiance and food1concentration are given as
+    constants here as an explicit stand-in, using the same values
+    already proven not to cause the population collapse a
+    food1concentration=0 fallback does (see build_advection_scenario()).
 
     pred1lightdep (formerly one of these constants) has been removed:
     it never appeared in any actual PASCAL model code, only in
@@ -341,6 +354,11 @@ def build_cmems_advection_scenario(
     _alias_reader_variable(physical, "temperature", "sea_water_temperature")
     _alias_reader_variable(physical, "mld", "ocean_mixed_layer_thickness")
 
+    pred_readers = (
+        build_pred1dens_readers(pred_data_dir, variable=pred_variable)
+        if pred_data_dir is not None else []
+    )
+
     constants = ConstantReader({
         "food1concentration": food1concentration_constant,
         "pred1dens": pred1dens_constant,
@@ -361,7 +379,7 @@ def build_cmems_advection_scenario(
         "nsupindividuals": n_super_individuals,
         "nvindividualspersupindividual": n_virtual_per_super,
         "global_settings": build_global_settings(stochastic=stochastic),
-        "reader": [physical, constants],
+        "reader": [physical] + pred_readers + [constants],
         "timestep": timestep,
         "start_date": start_date,
         "duration": duration_years,
@@ -390,6 +408,8 @@ def build_cmems_advection_scenario_from_file(
     food1concentration_constant=0.05,
     pred1dens_constant=0.00001,
     irradiance_constant=0.1,
+    pred_data_dir=None,
+    pred_variable="vpdens",
     headless="bench_run",
 ):
     """Same scientific setup as build_cmems_advection_scenario(), but reads
@@ -413,8 +433,9 @@ def build_cmems_advection_scenario_from_file(
     same reasons as build_cmems_advection_scenario() (see
     its docstring for the full detail, including the 2026-09-16 update on
     the multi-reader-group bug that used to zero food1concentration/
-    pred1dens and is now fixed upstream, and pred1dens's new real - but
-    not yet wired in here - data source).
+    pred1dens and is now fixed upstream). pred1dens's real data source is
+    wired in the same way too - see that docstring's 2026-09-16 update on
+    pred_data_dir/pred_variable.
     """
     from opendrift.readers.reader_constant import Reader as ConstantReader
     from opendrift.readers.reader_netCDF_CF_generic import Reader as CFReader
@@ -424,6 +445,11 @@ def build_cmems_advection_scenario_from_file(
     physical = CFReader(
         str(cmems_file),
         standard_name_mapping={"thetao": "temperature", "mlotst": "mld"},
+    )
+
+    pred_readers = (
+        build_pred1dens_readers(pred_data_dir, variable=pred_variable)
+        if pred_data_dir is not None else []
     )
 
     constants = ConstantReader({
@@ -446,7 +472,7 @@ def build_cmems_advection_scenario_from_file(
         "nsupindividuals": n_super_individuals,
         "nvindividualspersupindividual": n_virtual_per_super,
         "global_settings": build_global_settings(stochastic=stochastic),
-        "reader": [physical, constants],
+        "reader": [physical] + pred_readers + [constants],
         "timestep": timestep,
         "start_date": start_date,
         "duration": duration_years,
