@@ -20,6 +20,7 @@ import xarray as xr
 from pascal.coupler import PascalAdvection
 from pascal.scenarios import (
     build_a20_advection_scenario,
+    build_a20_readers,
     build_pred1dens_readers,
 )
 
@@ -297,3 +298,112 @@ def test_full_a20_run_reads_real_pred1dens_instead_of_fallback_constant(
     pred_series = np.asarray(sim.debug_output["env_pred1dens"], dtype=float)
     assert len(pred_series) > 0
     assert np.all((pred_series >= 0.1) & (pred_series <= 0.2))
+
+
+def _write_deterministic_temp_salt_zeta(data_dir, land_idx=(1, 1)):
+    """Overwrites reduced_temp.nc/reduced_salt.nc/reduced_zeta.nc (already
+    written with random noise by _write_a20_test_data()) with a
+    deterministic setup for testing _a20_mld_from_density()/the real land
+    mask (see build_a20_readers()'s/_inject_a20_grid_placeholders()'s
+    2026-09-16 updates): one column permanently NaN at every timestep
+    (land_idx - land, matching real ROMS _FillValue-masked land cells,
+    where every variable is NaN, not just zeta); a "pycnocline" column
+    (0, 0) with the two shallowest sigma layers identical and the deepest
+    one colder/saltier (denser); and a "well-mixed" column (2, 2), left
+    uniform top-to-bottom by the fill below - never crosses
+    mld_threshold()'s density criterion, so it should report the
+    "mixed to the bed" branch instead of a shallow mld.
+    """
+    shape_3d = (len(HIS_TIMES), N_S, N_ETA, N_XI)
+    temp = np.full(shape_3d, 5.0)
+    salt = np.full(shape_3d, 34.0)
+
+    # Pycnocline column: index order is bottom-up (see S_RHO/CS_R above,
+    # and z_r's own derivation) - so [1:] (indices 1, 2) is the two
+    # shallowest layers, [0] the deepest.
+    temp[:, 1:, 0, 0] = 8.0
+    salt[:, 1:, 0, 0] = 34.0
+    temp[:, 0, 0, 0] = 2.0
+    salt[:, 0, 0, 0] = 35.0
+
+    zeta = np.zeros((len(HIS_TIMES), N_ETA, N_XI))
+    ei, xi = land_idx
+    temp[:, :, ei, xi] = np.nan
+    salt[:, :, ei, xi] = np.nan
+    zeta[:, ei, xi] = np.nan
+
+    grid_coords = {
+        **_grid_coords(HIS_TIMES),
+        "s_rho": ("s_rho", S_RHO),
+        "Cs_r": ("s_rho", CS_R),
+        "hc": HC,
+        "h": (("eta_rho", "xi_rho"), H),
+    }
+    xr.Dataset(
+        data_vars={"temp": (("ocean_time", "s_rho", "eta_rho", "xi_rho"), temp)},
+        coords=grid_coords,
+    ).to_netcdf(data_dir / "reduced_temp.nc")
+    xr.Dataset(
+        data_vars={"salt": (("ocean_time", "s_rho", "eta_rho", "xi_rho"), salt)},
+        coords=grid_coords,
+    ).to_netcdf(data_dir / "reduced_salt.nc")
+    xr.Dataset(
+        data_vars={"zeta": (("ocean_time", "eta_rho", "xi_rho"), zeta)},
+        coords=grid_coords,
+    ).to_netcdf(data_dir / "reduced_zeta.nc")
+
+
+def test_mld_computed_from_density_reflects_stratification(tmp_path):
+    """mld should come from PASCAL's own density calculation now (see
+    pascal.scenarios::_a20_mld_from_density()), not the flat 30 m
+    constant build_a20_readers() used to fall back to for every cell/time
+    - a column with a real pycnocline should report a shallower mld than
+    a well-mixed column with no pycnocline at all."""
+    rng = np.random.default_rng(0)
+    _write_a20_test_data(tmp_path, rng)
+    _write_deterministic_temp_salt_zeta(tmp_path)
+
+    readers = build_a20_readers(tmp_path)
+    physical = readers[0]
+    assert "mld" in physical.variables
+
+    env, _ = physical.get_variables_interpolated(
+        ["mld"], time=dt.datetime(1995, 1, 24, 6),
+        lon=np.array([LON_RHO[0, 0], LON_RHO[2, 2]]),
+        lat=np.array([LAT_RHO[0, 0], LAT_RHO[2, 2]]),
+        z=np.array([-5.0, -5.0]),
+    )
+    mld_pycnocline, mld_wellmixed = env["mld"]
+
+    assert np.isfinite(mld_pycnocline) and np.isfinite(mld_wellmixed)
+    assert 0 < mld_pycnocline < H[0, 0]
+    # The well-mixed column never crosses the density threshold, so it
+    # should fall back to mld_threshold()'s "mixed to the bed" branch -
+    # close to the full ~193 m sigma-layer stack depth (H=200 minus the
+    # bottom sigma layer's own offset from the true seabed).
+    assert mld_wellmixed > 150
+    assert mld_pycnocline < 150
+    assert mld_pycnocline < mld_wellmixed
+
+
+def test_real_land_mask_from_nan_zeta(tmp_path):
+    """_inject_a20_grid_placeholders() used to set mask_rho all-ones
+    (every cell "water") regardless of the data; it's now derived from
+    zeta's own NaN pattern (see its 2026-09-16 update) - a cell that's
+    NaN at every timestep should report land_binary_mask == 1, not 0."""
+    rng = np.random.default_rng(0)
+    _write_a20_test_data(tmp_path, rng)
+    _write_deterministic_temp_salt_zeta(tmp_path, land_idx=(1, 1))
+
+    readers = build_a20_readers(tmp_path)
+    physical = readers[0]
+
+    env, _ = physical.get_variables_interpolated(
+        ["land_binary_mask"], time=dt.datetime(1995, 1, 24, 6),
+        lon=np.array([LON_RHO[1, 1], LON_RHO[0, 0]]),
+        lat=np.array([LAT_RHO[1, 1], LAT_RHO[0, 0]]),
+        z=np.array([0.0, 0.0]),
+    )
+    land_flag, water_flag = env["land_binary_mask"]
+    assert land_flag == 1.0
+    assert water_flag == 0.0

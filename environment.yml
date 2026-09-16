@@ -36,4 +36,5 @@ dependencies:
   - traja
   - adios_db
   - pyyaml
+  - gsw
   - pip

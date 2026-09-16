@@ -495,13 +495,39 @@ def _inject_a20_grid_placeholders(ds):
     attribute in a real extract). Synthesize the minimum
     reader_ROMS_native.Reader needs to run at all:
 
-    - mask_rho = all-ones (all water). Real simplification, not just a
-      stand-in for a missing attribute: land cells still come back NaN in
-      the actual variable data (ROMS's own _FillValue masking, decoded by
-      xarray automatically), so a particle sitting on real land still gets
-      missing environment data. But OpenDrift's own coastline detection
-      (general:coastline_action, land_binary_mask) will never trigger,
-      since it only looks at this synthetic mask.
+    - mask_rho, real: 1.0 (water) where `zeta` is finite at every
+      timestep, 0.0 (land) where it's NaN at every timestep - matches
+      reader_ROMS_native's own convention (land_binary_mask = 1 -
+      mask_rho). `zeta` is required on `ds` already (borrowed from
+      reduced_zeta.nc onto each reader's own time axis, for every A20
+      reader - see build_a20_readers()/_build_a20_food_reader()/
+      _build_a20_swrad_reader()) and its NaN pattern is confirmed
+      time-invariant against the real extract (1223/3306 cells,
+      identical at every one of 365 timesteps) - a genuine static land
+      mask, not per-timestep wet/dry cycling, so any single timestep
+      would give the same answer; `.all(...)` across time is used
+      anyway as the more conservative read (a cell only counts as land
+      if it's NaN at *every* timestep, not just one).
+
+      UPDATE 2026-09-16: previously an all-ones (all-water) stand-in.
+      Correcting this is a real but narrower fix than it looks:
+      reader_ROMS_native.get_variables() already NaNs out every
+      non-land_binary_mask variable at mask_rho==0, but land cells were
+      already independently NaN there via the variable's own ROMS
+      _FillValue (decoded by xarray automatically) regardless of
+      mask_rho - so environment readback at a land cell was already
+      correctly NaN before this fix. What mask_rho actually drives is
+      `land_binary_mask` (via reader_ROMS_native's standard_name_mapping)
+      and OpenDrift's coastline detection - except
+      build_a20_advection_scenario()'s tracker_config sets
+      `general:use_auto_landmask: True`, which makes OpenDrift drop any
+      reader-supplied land_binary_mask entirely and use its own built-in
+      GSHHG global coastline instead (see
+      Environment.__add_auto_landmask__()) - so real coastline
+      avoidance during a run was, and still is, handled by that global
+      landmask either way, not by mask_rho. The real fix here mainly
+      matters for anyone consuming the reader/its land_binary_mask
+      directly with use_auto_landmask left off.
     - Vtransform = 2, matching s_rho's declared standard_name
       "ocean_s_coordinate_g2" (CF convention: _g1 <-> Vtransform=1, _g2 <->
       Vtransform=2). Without this reader_ROMS_native defaults silently to
@@ -513,11 +539,111 @@ def _inject_a20_grid_placeholders(ds):
     import xarray as xr
 
     ds = ds.copy()
-    ds["mask_rho"] = xr.DataArray(
-        np.ones(ds["lat_rho"].shape, dtype=np.float64), dims=ds["lat_rho"].dims
-    )
+    is_land = ds["zeta"].isnull().all(dim="ocean_time")
+    ds["mask_rho"] = (1.0 - is_land.astype(np.float64)).transpose(*ds["lat_rho"].dims)
     ds["Vtransform"] = xr.DataArray(2)
     return ds
+
+
+def _z_r_vtransform2(h, zeta, s_rho, Cs_r, hc):
+    """ROMS Vtransform=2 vertical coordinate at RHO-points (mirrors
+    reader_ROMS_native's own depth calculation - needed here as a
+    stand-alone numpy version since _a20_mld_from_density() runs before
+    any reader exists yet, on plain merged-dataset arrays):
+
+        S = (hc*s + h*Cs) / (hc + h)
+        z = zeta + (zeta + h) * S
+
+    h : (eta, xi). zeta : (time, eta, xi). s_rho, Cs_r : (s_rho,). hc :
+    scalar. Returns z_r, negative down, shape (time, s_rho, eta, xi) -
+    ROMS's own bottom-to-surface sigma-layer order (index 0 = seabed),
+    matching s_rho/Cs_r/temp/salt's own layer ordering, unchanged here.
+    """
+    h = np.asarray(h)
+    zeta = np.asarray(zeta).reshape(-1, *h.shape)
+    s_rho = np.asarray(s_rho)[None, :, None, None]
+    Cs_r = np.asarray(Cs_r)[None, :, None, None]
+    hh = h[None, None, :, :]
+    zz = zeta[:, None, :, :]
+    S = (hc * s_rho + hh * Cs_r) / (hc + hh)
+    return zz + (zz + hh) * S
+
+
+def _a20_mld_from_density(his, dsigma=0.03, z_ref=-10.0):
+    """Mixed-layer depth from a density-threshold criterion (de Boyer
+    Montegut et al. 2004-style: the shallowest depth where potential
+    density exceeds a near-surface reference value by more than
+    `dsigma`), computed from A20's own temperature/salinity rather than
+    read from any file - ROMS doesn't output mld directly, and this A20
+    extract has no other real mld source (CMEMS scenarios do, via
+    ocean_mixed_layer_thickness - see build_cmems_advection_scenario()).
+    Ported from the worked example in a20_test/test_mld.py (its
+    mld_threshold()/z_w_vtransform2() - only the RHO-point depth is
+    needed here, see _z_r_vtransform2()), dropping that script's unused
+    AKs-threshold alternative and its plotting/CMEMS-comparison code.
+
+    his must be the merged A20 "his" dataset build_a20_readers() already
+    builds from A20_HIS_VARS (temp, salt, zeta, h, hc, s_rho, Cs_r,
+    lat_rho, lon_rho all present) - called *before*
+    _inject_a20_grid_placeholders() replaces mask_rho, but that doesn't
+    matter here: land cells are identified from temp/salt's own NaNs
+    (ROMS's _FillValue masking), not from mask_rho.
+
+    Density is computed via TEOS-10 (the `gsw` package): absolute
+    salinity and conservative temperature from practical salinity/
+    in-situ temperature and pressure (from RHO-point depth via
+    gsw.p_from_z), then potential density anomaly referenced to the
+    surface (gsw.sigma0) - standard practice, and what CMEMS's own
+    ocean_mixed_layer_thickness product is derived the same way for.
+
+    Returns an (ocean_time, eta_rho, xi_rho) array, positive metres.
+    NaN on land (where temp/salt are already NaN) or, for the very rare
+    column shallower than z_ref, falls back to that column's own
+    surface density as the reference instead of leaving it NaN. A
+    column that never crosses the density threshold down to the seabed
+    is reported as mixed to the bed, not NaN.
+    """
+    import gsw
+
+    z_r = _z_r_vtransform2(his["h"].values, his["zeta"].values,
+                            his["s_rho"].values, his["Cs_r"].values,
+                            float(his["hc"]))
+    lat = his["lat_rho"].values
+    lon = his["lon_rho"].values
+
+    p = gsw.p_from_z(z_r, lat[None, None, :, :])
+    SA = gsw.SA_from_SP(his["salt"].values, p,
+                         lon[None, None, :, :], lat[None, None, :, :])
+    CT = gsw.CT_from_pt(SA, his["temp"].values)
+    sigma0 = gsw.sigma0(SA, CT)
+
+    # ROMS's bottom-to-surface layer order flipped to work surface-first,
+    # matching de Boyer Montegut's own convention and z_ref's sign.
+    sig, z = sigma0[:, ::-1], z_r[:, ::-1]
+    nt, nz, ny, nx = sig.shape
+
+    sig_ref = np.full((nt, ny, nx), np.nan)
+    for k in range(nz - 1):
+        hit = (z[:, k] >= z_ref) & (z[:, k + 1] < z_ref) & np.isnan(sig_ref)
+        if hit.any():
+            f = (z[:, k] - z_ref) / (z[:, k] - z[:, k + 1])
+            sig_ref[hit] = (sig[:, k] + f * (sig[:, k + 1] - sig[:, k]))[hit]
+    shallow = np.isnan(sig_ref) & ~np.isnan(sig[:, 0])
+    sig_ref[shallow] = sig[:, 0][shallow]
+
+    target = sig_ref + dsigma
+    mld = np.full((nt, ny, nx), np.nan)
+    for k in range(1, nz):
+        cross = (sig[:, k] >= target) & np.isnan(mld) & ~np.isnan(sig[:, k])
+        if cross.any():
+            ds = sig[:, k] - sig[:, k - 1]
+            f = np.where(np.abs(ds) > 1e-12, (target - sig[:, k - 1]) / ds, 0.0)
+            zc = z[:, k - 1] + f * (z[:, k] - z[:, k - 1])
+            mld[cross] = -zc[cross]
+    unmixed = np.isnan(mld) & ~np.isnan(sig[:, 0])
+    mld[unmixed] = -z[:, -1][unmixed]
+
+    return mld
 
 
 def _build_a20_food_reader(data_dir, food_variable):
@@ -636,17 +762,19 @@ def build_pred1dens_readers(pred_data_dir, variable="vpdens"):
 def build_a20_readers(data_dir, food_variable="Chl_bc", pred_data_dir=None,
                        pred_variable="vpdens"):
     """The reader stack for a real A20 ROMS/ECOSMO run: physical variables
-    (temperature/salinity/velocities/vertical diffusivity/depth/synthetic
-    land mask) from the history (his) output group; food1concentration
-    from its own diagnostic (dia) reader, on its own native noon-offset
-    axis; irradiance from its own quicksave (qck) reader, on its own native
-    hourly axis; visual predator density from pred_data_dir if given (see
-    build_pred1dens_readers()); and a ConstantReader for whatever's left
-    with no data source (mld always; pred1dens too when pred_data_dir is
-    None - same gap the CMEMS scenarios above already have). The real
-    pred1dens readers, when present, are placed *before*
-    the constant in the list, so they take priority for whichever years
-    they cover and the constant only kicks in outside that range.
+    (temperature/salinity/velocities/vertical diffusivity/depth/real land
+    mask/real mld - see _inject_a20_grid_placeholders()/
+    _a20_mld_from_density()) from the history (his) output group;
+    food1concentration from its own diagnostic (dia) reader, on its own
+    native noon-offset axis; irradiance from its own quicksave (qck)
+    reader, on its own native hourly axis; visual predator density from
+    pred_data_dir if given (see build_pred1dens_readers()); and a
+    ConstantReader for whatever's left with no data source (pred1dens,
+    when pred_data_dir is None - same gap the CMEMS scenarios above
+    already have). The real pred1dens readers, when present, are placed
+    *before* the constant in the list, so they take priority for
+    whichever years they cover and the constant only kicks in outside
+    that range.
 
     food1concentration/irradiance each being their own reader (rather than
     being reindexed onto his's axis and merged into one reader) only works
@@ -671,10 +799,18 @@ def build_a20_readers(data_dir, food_variable="Chl_bc", pred_data_dir=None,
                           chunks={"ocean_time": 1}) for v in A20_HIS_VARS],
         compat="override", join="exact",
     )
+    his["mld"] = xr.DataArray(_a20_mld_from_density(his),
+                               dims=("ocean_time", "eta_rho", "xi_rho"))
     his = _inject_a20_grid_placeholders(his)
     physical_reader = ROMSReader(
         filename=his, name="a20_physical",
-        standard_name_mapping={"temp": "temperature"},
+        # "mld": "mld" isn't a rename - it's what actually keeps the
+        # variable from being dropped: reader_ROMS_native only keeps
+        # variables it recognizes (its own ROMS_variable_mapping, which
+        # has no entry for a variable named "mld") or that are in
+        # standard_name_mapping, so this is required even though
+        # PASCAL's own name and the raw variable name are identical.
+        standard_name_mapping={"temp": "temperature", "mld": "mld"},
     )
 
     pred_readers = (
@@ -686,7 +822,6 @@ def build_a20_readers(data_dir, food_variable="Chl_bc", pred_data_dir=None,
              _build_a20_swrad_reader(data_dir)] + pred_readers +
             [ConstantReader({
                 "pred1dens": 0.00001,
-                "mld": 30,
             })])
 
 
