@@ -281,13 +281,20 @@ def build_cmems_advection_scenario(
     full mechanism and the opendrift fork's fix (with regression tests).
     Not yet re-verified here specifically: whether re-enabling the bgc
     reader now correctly returns real chlorophyll data (the bug that
-    silently zeroed it is fixed), and separately, whether
-    mass_concentration_of_chlorophyll_a_in_sea_water needs a unit/scale
-    conversion to become PASCAL's food1concentration - that domain
-    question was never answered and still needs the model owner, fix or
-    no fix. food1concentration therefore stays a constant here for now;
-    re-enabling the bgc reader is a reasonable follow-up, not done as
-    part of this fix.
+    silently zeroed it is fixed).
+
+    UPDATE 2026-09-16: the unit/scale question above is answered - it's
+    not a reader-side conversion at all. PASCAL's food1concentration is
+    expected to arrive as a raw chlorophyll-a mass concentration;
+    pascal/biology/growth.py converts it to carbon units internally with
+    a hardcoded Chl:C ratio (`chltocarbon = 30.00`, see
+    estimate_growth()/estimate_growth_stochastic()). So
+    mass_concentration_of_chlorophyll_a_in_sea_water can alias directly
+    to food1concentration with no extra scaling at the reader level.
+    food1concentration still stays a constant here for now -
+    re-enabling the bgc reader (now unblocked on both the reader bug and
+    the unit question) is a reasonable follow-up, not done as part of
+    this fix.
 
     Previously observed here too (now explained by the same root cause):
     even a plain ConstantReader-supplied food1concentration read back as
