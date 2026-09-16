@@ -535,15 +535,61 @@ def _build_a20_swrad_reader(data_dir):
     return qck_reader
 
 
-def build_a20_readers(data_dir, food_variable="Chl_bc"):
+def build_pred1dens_readers(pred_data_dir, variable="vpdens"):
+    """One reader per year subfolder's netCDF file under pred_data_dir
+    (pred_data_dir/<year>/*.nc - the layout of a20_test/pred_data),
+    aliasing `variable` (a raw netCDF variable name, not a CF
+    standard_name - e.g. "vpdens", same convention as
+    build_cmems_advection_scenario_from_file's thetao/mlotst aliasing)
+    directly to PASCAL's pred1dens.
+
+    Each file covers exactly one calendar year on its own "hours since
+    <year>-01-01" time axis, on a plain regular lat/lon/depth grid (unlike
+    the A20 ROMS output, no grid-metadata workarounds are needed here), so
+    a plain reader_netCDF_CF_generic.Reader per file is enough - one
+    reader per file lets OpenDrift's normal multi-reader priority
+    mechanism (Environment.get_reader_groups(); a reader whose own
+    start_time/end_time doesn't cover the requested timestep is skipped in
+    favour of the next one in priority order) pick whichever year's file
+    actually covers a given timestep, rather than needing any manual
+    per-timestep file-switching logic here.
+
+    Returned in year order (oldest first) purely for readability - reader
+    priority only matters relative to whatever reader list position the
+    caller inserts this at (see build_a20_readers()), not the order
+    within this list, since these files' time coverages don't overlap
+    each other.
+    """
+    from opendrift.readers.reader_netCDF_CF_generic import Reader as CFReader
+
+    pred_data_dir = Path(pred_data_dir)
+    files = sorted(pred_data_dir.glob("*/*.nc"))
+    if not files:
+        raise FileNotFoundError(
+            f"No netCDF files found under {pred_data_dir}/*/*.nc "
+            "(expected one per year subfolder, e.g. <pred_data_dir>/1995/*.nc)"
+        )
+    return [
+        CFReader(str(f), name=f"pred1dens_{f.parent.name}",
+                 standard_name_mapping={variable: "pred1dens"})
+        for f in files
+    ]
+
+
+def build_a20_readers(data_dir, food_variable="Chl_bc", pred_data_dir=None,
+                       pred_variable="vpdens"):
     """The reader stack for a real A20 ROMS/ECOSMO run: physical variables
     (temperature/salinity/velocities/vertical diffusivity/depth/synthetic
     land mask) from the history (his) output group; food1concentration
     from its own diagnostic (dia) reader, on its own native noon-offset
     axis; irradiance from its own quicksave (qck) reader, on its own native
-    hourly axis; and a ConstantReader for the variables ROMS has no
-    equivalent for (pred1dens/pred1lightdep/mld - same gap the CMEMS
-    scenarios above already have).
+    hourly axis; visual predator density from pred_data_dir if given (see
+    build_pred1dens_readers()); and a ConstantReader for whatever's left
+    with no data source (pred1lightdep/mld always; pred1dens too when
+    pred_data_dir is None - same gap the CMEMS scenarios above already
+    have). The real pred1dens readers, when present, are placed *before*
+    the constant in the list, so they take priority for whichever years
+    they cover and the constant only kicks in outside that range.
 
     food1concentration/irradiance each being their own reader (rather than
     being reindexed onto his's axis and merged into one reader) only works
@@ -574,13 +620,18 @@ def build_a20_readers(data_dir, food_variable="Chl_bc"):
         standard_name_mapping={"temp": "temperature"},
     )
 
-    return [physical_reader, _build_a20_food_reader(data_dir, food_variable),
-            _build_a20_swrad_reader(data_dir),
-            ConstantReader({
+    pred_readers = (
+        build_pred1dens_readers(pred_data_dir, variable=pred_variable)
+        if pred_data_dir is not None else []
+    )
+
+    return ([physical_reader, _build_a20_food_reader(data_dir, food_variable),
+             _build_a20_swrad_reader(data_dir)] + pred_readers +
+            [ConstantReader({
                 "pred1dens": 0.00001,
                 "pred1lightdep": 0.1,
                 "mld": 30,
-            })]
+            })])
 
 
 def build_a20_advection_scenario(
@@ -595,6 +646,8 @@ def build_a20_advection_scenario(
     start_date=None,
     start_location=(14.7, 69.53),
     food_variable="Chl_bc",
+    pred_data_dir=None,
+    pred_variable="vpdens",
     headless="bench_run",
 ):
     """Return kwargs ready to pass to coupler.PascalAdvection(**kwargs),
@@ -613,11 +666,19 @@ def build_a20_advection_scenario(
     this area. start_date defaults to one day after the A20 test extract's
     own start time (1995-01-24), since asking for data before a reader's
     start_time raises.
+
+    pred_data_dir, if given, points at real visual-predator-density fields
+    (a20_test/pred_data - one netCDF per calendar-year subfolder; see
+    build_pred1dens_readers()) instead of the ConstantReader fallback used
+    for pred1dens otherwise.
     """
     np.random.seed(seed)
 
     data_dir = Path(data_dir)
-    readers = build_a20_readers(data_dir, food_variable=food_variable)
+    readers = build_a20_readers(
+        data_dir, food_variable=food_variable,
+        pred_data_dir=pred_data_dir, pred_variable=pred_variable,
+    )
 
     timestep = dt.timedelta(seconds=timestep_seconds)
     if start_date is None:

@@ -18,7 +18,10 @@ import numpy as np
 import xarray as xr
 
 from pascal.coupler import PascalAdvection
-from pascal.scenarios import build_a20_advection_scenario
+from pascal.scenarios import (
+    build_a20_advection_scenario,
+    build_pred1dens_readers,
+)
 
 N_ETA, N_XI, N_S = 3, 3, 3
 LAT_RHO = np.array([[69.0, 69.0, 69.0], [69.1, 69.1, 69.1], [69.2, 69.2, 69.2]])
@@ -181,3 +184,116 @@ def test_full_run_against_a20_test_data_completes(tmp_path, monkeypatch):
     assert (output_dir / "output_ps.nc").exists()
     assert (output_dir / "lifestats.csv").exists()
     assert sim.population_size() > 0
+
+
+# Deliberately a wider, plain regular lat/lon/depth grid than the A20 ROMS
+# fixture above (mirrors the real a20_test/pred_data files: no curvilinear
+# ROMS grid or missing-metadata workarounds needed here) - covers the same
+# (14.1, 69.1) test point used throughout this file.
+PRED_LON = np.array([13.0, 14.0, 15.0])
+PRED_LAT = np.array([68.0, 69.0, 70.0])
+PRED_DEPTH = np.array([0.0, 10.0, 50.0, 100.0])
+
+
+def _write_pred_year_file(pred_data_dir, year, value_range, rng, days=30):
+    """One a20_test/pred_data-style year file: vpdens on a plain
+    (time, depth, lat, lon) grid, no standard_name (aliased by raw
+    variable name, same as build_pred1dens_readers() expects),
+    six-hourly timesteps on its own "hours since <year>-01-01" axis -
+    `days` worth by default (not a full year, unlike the real files),
+    enough to cover the short test runs below (which start ~24 days in,
+    matching the A20 ROMS fixture's own start_date)."""
+    year_dir = pred_data_dir / str(year)
+    year_dir.mkdir(parents=True)
+    times = np.arange(0, days * 24, 6, dtype="float64")
+    lo, hi = value_range
+    vpdens = rng.uniform(lo, hi, size=(len(times), len(PRED_DEPTH),
+                                        len(PRED_LAT), len(PRED_LON)))
+    ds = xr.Dataset(
+        data_vars={
+            "vpdens": (("time", "depth", "lat", "lon"), vpdens.astype("float32"),
+                       {"long_name": "synthetic visual predator density",
+                        "units": "1"}),
+        },
+        coords={
+            "time": ("time", times,
+                      {"units": f"hours since {year}-01-01 00:00:00",
+                       "standard_name": "time"}),
+            "depth": ("depth", PRED_DEPTH,
+                      {"units": "m", "standard_name": "depth", "positive": "down"}),
+            "lat": ("lat", PRED_LAT,
+                    {"units": "degrees_north", "standard_name": "latitude"}),
+            "lon": ("lon", PRED_LON,
+                    {"units": "degrees_east", "standard_name": "longitude"}),
+        },
+    )
+    ds.to_netcdf(year_dir / "vpdens.nc")
+
+
+def test_pred1dens_readers_alias_and_cover_each_year(tmp_path):
+    rng = np.random.default_rng(0)
+    pred_data_dir = tmp_path / "pred_data"
+    _write_pred_year_file(pred_data_dir, 1995, (0.1, 0.2), rng)
+    _write_pred_year_file(pred_data_dir, 1996, (0.5, 0.6), rng)
+
+    readers = build_pred1dens_readers(pred_data_dir)
+    assert len(readers) == 2
+    for reader in readers:
+        # vpdens carries no standard_name PASCAL matches directly - if the
+        # standard_name_mapping override wasn't wired through, pred1dens
+        # would be absent here.
+        assert "pred1dens" in reader.variables
+
+    readers_by_year = {r.name: r for r in readers}
+    r1995 = readers_by_year["pred1dens_1995"]
+    r1996 = readers_by_year["pred1dens_1996"]
+
+    env_1995, _ = r1995.get_variables_interpolated(
+        ["pred1dens"], time=dt.datetime(1995, 1, 1, 6),
+        lon=np.array([14.0]), lat=np.array([69.0]), z=np.array([-5.0]),
+        profiles=["pred1dens"], profiles_depth=50,
+    )
+    assert 0.1 <= env_1995["pred1dens"][0] <= 0.2
+
+    env_1996, _ = r1996.get_variables_interpolated(
+        ["pred1dens"], time=dt.datetime(1996, 1, 1, 6),
+        lon=np.array([14.0]), lat=np.array([69.0]), z=np.array([-5.0]),
+        profiles=["pred1dens"], profiles_depth=50,
+    )
+    assert 0.5 <= env_1996["pred1dens"][0] <= 0.6
+
+
+def test_full_a20_run_reads_real_pred1dens_instead_of_fallback_constant(
+    tmp_path, monkeypatch,
+):
+    """The whole point of wiring pred_data_dir in: env_pred1dens in a real
+    run should reflect the real per-year field (0.1-0.2 here), not
+    build_a20_readers()'s ConstantReader fallback (0.00001)."""
+    monkeypatch.chdir(tmp_path)
+    rng = np.random.default_rng(0)
+
+    data_dir = tmp_path / "a20_data"
+    data_dir.mkdir()
+    _write_a20_test_data(data_dir, rng)
+
+    pred_data_dir = tmp_path / "pred_data"
+    _write_pred_year_file(pred_data_dir, 1995, (0.1, 0.2), rng)
+
+    kwargs = build_a20_advection_scenario(
+        data_dir,
+        n_super_individuals=5,
+        n_virtual_per_super=1000,
+        duration_years=0.005,
+        seeding_rate=5,
+        start_location=(14.1, 69.1),
+        start_date=dt.datetime(1995, 1, 24, 6),
+        pred_data_dir=pred_data_dir,
+        headless="a20_pred_run",
+    )
+    sim = PascalAdvection(**kwargs, debug=["env_pred1dens"], verbose=True)
+    sim.run()
+
+    assert sim.population_size() > 0
+    pred_series = np.asarray(sim.debug_output["env_pred1dens"], dtype=float)
+    assert len(pred_series) > 0
+    assert np.all((pred_series >= 0.1) & (pred_series <= 0.2))
