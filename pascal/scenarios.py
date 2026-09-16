@@ -189,7 +189,6 @@ def build_advection_scenario(
         "food1concentration": 0.05,
         "irradiance": 0.1,
         "pred1dens": 0.00001,
-        "pred1lightdep": 0.1,
         "mld": 100,
     })
 
@@ -237,7 +236,6 @@ def build_cmems_advection_scenario(
     start_location=(14.25, 69.8),
     food1concentration_constant=0.05,
     pred1dens_constant=0.00001,
-    pred1lightdep_constant=0.1,
     irradiance_constant=0.1,
     headless="bench_run",
 ):
@@ -300,20 +298,25 @@ def build_cmems_advection_scenario(
     re-tested (would need re-running a real CMEMS scenario, out of scope
     for this pass) - flagged as follow-up.
 
-    irradiance/pred1dens/pred1lightdep have no CMEMS equivalent at all.
-    pred1dens now has a real (non-CMEMS) source - see
-    pascal.scenarios::build_pred1dens_readers(), real visual-predator-
-    density fields covering 1995-1997 (a20_test/pred_data) - already
-    wired into build_a20_advection_scenario() but not into this CMEMS
-    scenario; doing so is a reasonable follow-up given the two share a
-    domain (a20_test/pred_data's grid covers this scenario's default
-    start_location) but hasn't been done. pred1lightdep has no data
-    source at all; irradiance needs a real derivation from a surface
-    radiation product (e.g. ERA5 via the Copernicus Climate Data Store),
-    not yet integrated. All three (plus food1concentration) are given as
-    constants here as an explicit stand-in, using the same values already
-    proven not to cause the population collapse a food1concentration=0
-    fallback does (see build_advection_scenario()).
+    irradiance/pred1dens have no CMEMS equivalent at all. pred1dens now
+    has a real (non-CMEMS) source - see pascal.scenarios::
+    build_pred1dens_readers(), real visual-predator-density fields
+    covering 1995-1997 (a20_test/pred_data) - already wired into
+    build_a20_advection_scenario() but not into this CMEMS scenario;
+    doing so is a reasonable follow-up given the two share a domain
+    (a20_test/pred_data's grid covers this scenario's default
+    start_location) but hasn't been done. irradiance needs a real
+    derivation from a surface radiation product (e.g. ERA5 via the
+    Copernicus Climate Data Store), not yet integrated. Both (plus
+    food1concentration) are given as constants here as an explicit
+    stand-in, using the same values already proven not to cause the
+    population collapse a food1concentration=0 fallback does (see
+    build_advection_scenario()).
+
+    pred1lightdep (formerly one of these constants) has been removed:
+    it never appeared in any actual PASCAL model code, only in
+    required_variables/reader defaults, so it was dead weight rather
+    than an open data gap.
     """
     from netrc import netrc
 
@@ -334,7 +337,6 @@ def build_cmems_advection_scenario(
     constants = ConstantReader({
         "food1concentration": food1concentration_constant,
         "pred1dens": pred1dens_constant,
-        "pred1lightdep": pred1lightdep_constant,
         "irradiance": irradiance_constant,
     })
 
@@ -380,7 +382,6 @@ def build_cmems_advection_scenario_from_file(
     start_location=(14.25, 69.8),
     food1concentration_constant=0.05,
     pred1dens_constant=0.00001,
-    pred1lightdep_constant=0.1,
     irradiance_constant=0.1,
     headless="bench_run",
 ):
@@ -401,8 +402,8 @@ def build_cmems_advection_scenario_from_file(
     already carry CF standard_names eastward_/northward_sea_water_velocity,
     which OpenDrift matches to x_/y_sea_water_velocity automatically.
 
-    food1concentration/irradiance/pred1dens/pred1lightdep are constants
-    here for the same reasons as build_cmems_advection_scenario() (see
+    food1concentration/irradiance/pred1dens are constants here for the
+    same reasons as build_cmems_advection_scenario() (see
     its docstring for the full detail, including the 2026-09-16 update on
     the multi-reader-group bug that used to zero food1concentration/
     pred1dens and is now fixed upstream, and pred1dens's new real - but
@@ -421,7 +422,6 @@ def build_cmems_advection_scenario_from_file(
     constants = ConstantReader({
         "food1concentration": food1concentration_constant,
         "pred1dens": pred1dens_constant,
-        "pred1lightdep": pred1lightdep_constant,
         "irradiance": irradiance_constant,
     })
 
@@ -609,9 +609,9 @@ def build_a20_readers(data_dir, food_variable="Chl_bc", pred_data_dir=None,
     axis; irradiance from its own quicksave (qck) reader, on its own native
     hourly axis; visual predator density from pred_data_dir if given (see
     build_pred1dens_readers()); and a ConstantReader for whatever's left
-    with no data source (pred1lightdep/mld always; pred1dens too when
-    pred_data_dir is None - same gap the CMEMS scenarios above already
-    have). The real pred1dens readers, when present, are placed *before*
+    with no data source (mld always; pred1dens too when pred_data_dir is
+    None - same gap the CMEMS scenarios above already have). The real
+    pred1dens readers, when present, are placed *before*
     the constant in the list, so they take priority for whichever years
     they cover and the constant only kicks in outside that range.
 
@@ -653,7 +653,6 @@ def build_a20_readers(data_dir, food_variable="Chl_bc", pred_data_dir=None,
              _build_a20_swrad_reader(data_dir)] + pred_readers +
             [ConstantReader({
                 "pred1dens": 0.00001,
-                "pred1lightdep": 0.1,
                 "mld": 30,
             })])
 

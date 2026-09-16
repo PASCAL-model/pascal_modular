@@ -63,7 +63,6 @@ class PascalDrift(OceanDrift):
         'food1concentration':{'fallback':0, 'profiles': True},
         'irradiance':{'fallback':0, 'profiles': True},
         'pred1dens':{'fallback':0, 'profiles': True},
-        'pred1lightdep':{'fallback':0, 'profiles': True},
       }
 
     # Default colors for plotting
