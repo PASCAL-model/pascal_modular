@@ -6,6 +6,7 @@ from .utils import dotdict, flatten_list, flatten_dict, points_within_distance
 from .biology import survival as sv
 
 import datetime as dt
+import logging
 import numpy as np
 import pandas as pd
 import termcolor
@@ -668,7 +669,16 @@ class PascalAdvection(PascalSimulation):
     def prep_environment(self, reader):
         self.free_env_indices = list(np.arange(0, self.nsup))
         self.time_ind = 0
-        self.tracker = PascalDrift(loglevel=100)
+        # loglevel used to be 100 (above CRITICAL - total silence from
+        # OpenDrift, including its own warnings about missing forcing
+        # data silently falling back to a configured constant; see
+        # opendrift's environment.py Environment.get_environment() -
+        # 2026-09-16 update promoted those specific messages from
+        # debug to warning, but that only reaches stdout/stderr if this
+        # tracker's own loglevel lets WARNING through). WARNING now
+        # surfaces those (and OpenDrift's other genuine warnings, e.g.
+        # reader setup notices) without the volume of INFO/DEBUG.
+        self.tracker = PascalDrift(loglevel=logging.WARNING)
         if isinstance(reader, (list, tuple)):
             for r in reader:
                 self.tracker.add_reader(r)

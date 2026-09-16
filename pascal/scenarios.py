@@ -32,6 +32,24 @@ PROFILE_VARS = ["temperature", "food1concentration", "irradiance", "pred1dens"]
 # "angle" needed, unlike native ROMS u/v.
 A20_HIS_VARS = ["temp", "salt", "u_eastward", "v_northward", "w", "AKs", "zeta"]
 
+# Variable name -> file name stem, for the (as of 2026-09-16) A20_HIS_VARS
+# entries whose reduced_<name>.nc file isn't just reduced_<var>.nc - the
+# real extract's u_eastward/v_northward variables ship in reduced_u.nc/
+# reduced_v.nc, not reduced_u_eastward.nc/reduced_v_northward.nc (the
+# variable *name* inside each file is still u_eastward/v_northward).
+# Anything not listed here uses its own variable name as the file stem.
+A20_HIS_FILE_NAMES = {"u_eastward": "u", "v_northward": "v"}
+
+# ROMS Vtransform=2 vertical-coordinate parameter (TCLINE in ROMS's own
+# terms) - a fixed property of the A20 model *configuration*, not the
+# forcing data, so it doesn't vary between extracts/years. Confirmed
+# against a real A20 ROMS config (a20_v3y.in: TCLINE/hc == 100.0) - see
+# _inject_a20_grid_placeholders()'s Vtransform note for the rest of that
+# config. The "reduced" extract's own files don't always carry an `hc`
+# variable (present in some extracts, absent in others - e.g. the
+# 2026-09-16 2019-2020 subset), so this is injected rather than read.
+A20_HC = 100.0
+
 
 def compute_total_tsteps(start_date, duration_years, timestep, isplit=1):
     """Mirror PascalSimulation's timestep-count logic so synthetic arrays
@@ -535,6 +553,14 @@ def _inject_a20_grid_placeholders(ds):
       sigma layer. Confirmed against a real A20 ROMS config (a20_v3y.in:
       Vtransform == 2, Vstretching == 2, THETA_S == 6.0, THETA_B == 0.1,
       TCLINE/hc == 100.0, N == 35).
+    - hc = A20_HC (100.0), unconditionally overwritten same as Vtransform
+      rather than only filling it in when absent - some extracts carry
+      their own (correct, identical) `hc` variable and some don't (see
+      A20_HC's own docstring), and this makes every A20 reader agree
+      regardless. Needed by both reader_ROMS_native's own depth
+      calculation and _a20_mld_from_density() (called on `ds` *after*
+      this function in build_a20_readers(), so it can rely on hc always
+      being present here).
     """
     import xarray as xr
 
@@ -542,6 +568,7 @@ def _inject_a20_grid_placeholders(ds):
     is_land = ds["zeta"].isnull().all(dim="ocean_time")
     ds["mask_rho"] = (1.0 - is_land.astype(np.float64)).transpose(*ds["lat_rho"].dims)
     ds["Vtransform"] = xr.DataArray(2)
+    ds["hc"] = xr.DataArray(A20_HC)
     return ds
 
 
@@ -661,14 +688,16 @@ def _build_a20_food_reader(data_dir, food_variable):
     # 2D all-zero array with no time dimension, and any non-surface (z !=
     # 0) request raises IndexError. Borrow zeta from the his group's file,
     # reindexed onto dia's own (noon) ocean_time axis. dia also lacks
-    # hc/Cs_r/h entirely (only s_rho, time-invariant so copied as-is) -
-    # Reader.get_variables() needs all four for any non-surface request.
+    # Cs_r/h entirely (only s_rho, time-invariant so copied as-is) -
+    # Reader.get_variables() needs all three for any non-surface request.
+    # hc is *not* copied from temp_ds - _inject_a20_grid_placeholders()
+    # below injects A20_HC directly, since not every extract's files
+    # carry their own hc (see that function's docstring).
     temp_ds = xr.open_dataset(data_dir / "reduced_temp.nc", decode_times=False,
                               chunks={"ocean_time": 1})
     zeta_ds = xr.open_dataset(data_dir / "reduced_zeta.nc", decode_times=False,
                               chunks={"ocean_time": 1})
     dia["zeta"] = zeta_ds["zeta"].reindex(ocean_time=dia["ocean_time"], method="nearest")
-    dia["hc"] = temp_ds["hc"]
     dia["Cs_r"] = temp_ds["Cs_r"]
     dia["h"] = temp_ds["h"]
     dia = _inject_a20_grid_placeholders(dia)
@@ -785,8 +814,10 @@ def build_a20_readers(data_dir, food_variable="Chl_bc", pred_data_dir=None,
     on pred1dens there).
 
     data_dir must contain one ROMS output variable per file, named
-    reduced_<var>.nc (temp, salt, u_eastward, v_northward, w, AKs, zeta,
-    <food_variable>, swrad) - the convention used by the A20 test extract.
+    reduced_<var>.nc for each of A20_HIS_VARS (except u_eastward/
+    v_northward, which ship as reduced_u.nc/reduced_v.nc - see
+    A20_HIS_FILE_NAMES), <food_variable>, and swrad - the convention
+    used by the A20 test extract.
     """
     from opendrift.readers.reader_constant import Reader as ConstantReader
     from opendrift.readers.reader_ROMS_native import Reader as ROMSReader
@@ -795,13 +826,18 @@ def build_a20_readers(data_dir, food_variable="Chl_bc", pred_data_dir=None,
     data_dir = Path(data_dir)
 
     his = xr.merge(
-        [xr.open_dataset(data_dir / f"reduced_{v}.nc", decode_times=False,
-                          chunks={"ocean_time": 1}) for v in A20_HIS_VARS],
+        [xr.open_dataset(data_dir / f"reduced_{A20_HIS_FILE_NAMES.get(v, v)}.nc",
+                          decode_times=False, chunks={"ocean_time": 1})
+         for v in A20_HIS_VARS],
         compat="override", join="exact",
     )
+    # Placeholders (mask_rho/Vtransform/hc) injected *before* computing
+    # mld, not after - _a20_mld_from_density() needs a real hc, which
+    # this function supplies unconditionally regardless of whether the
+    # extract's own files carry one (see its docstring).
+    his = _inject_a20_grid_placeholders(his)
     his["mld"] = xr.DataArray(_a20_mld_from_density(his),
                                dims=("ocean_time", "eta_rho", "xi_rho"))
-    his = _inject_a20_grid_placeholders(his)
     physical_reader = ROMSReader(
         filename=his, name="a20_physical",
         # "mld": "mld" isn't a rename - it's what actually keeps the

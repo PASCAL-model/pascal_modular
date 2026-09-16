@@ -49,36 +49,39 @@ def _grid_coords(ocean_time):
     }
 
 
-def _write_his_var(path, var_name, values, rng):
+def _write_his_var(path, var_name, values, rng, include_hc=True):
     """One history-group variable file: 3D profile variables (temp, salt,
-    u_eastward, v_northward, w, AKs) carry s_rho/Cs_r/hc/h directly (needed
-    by every merged member for xr.merge's join="exact"); zeta is 2D
-    (surface only, no depth dim), matching the real files."""
+    u_eastward, v_northward, w, AKs) carry s_rho/Cs_r/h directly (needed
+    by every merged member for xr.merge's join="exact"), and hc too
+    unless include_hc=False (some real extracts carry their own hc, some
+    don't - see pascal.scenarios::A20_HC); zeta is 2D (surface only, no
+    depth dim), matching the real files."""
     data_vars = {var_name: (("ocean_time", "s_rho", "eta_rho", "xi_rho"), values)}
-    ds = xr.Dataset(
-        data_vars=data_vars,
-        coords={
-            **_grid_coords(HIS_TIMES),
-            "s_rho": ("s_rho", S_RHO),
-            "Cs_r": ("s_rho", CS_R),
-            "hc": HC,
-            "h": (("eta_rho", "xi_rho"), H),
-        },
-    )
+    coords = {
+        **_grid_coords(HIS_TIMES),
+        "s_rho": ("s_rho", S_RHO),
+        "Cs_r": ("s_rho", CS_R),
+        "h": (("eta_rho", "xi_rho"), H),
+    }
+    if include_hc:
+        coords["hc"] = HC
+    ds = xr.Dataset(data_vars=data_vars, coords=coords)
     ds.to_netcdf(path)
 
 
-def _write_his_zeta(path):
+def _write_his_zeta(path, include_hc=True):
     zeta = np.zeros((len(HIS_TIMES), N_ETA, N_XI))
+    coords = {
+        **_grid_coords(HIS_TIMES),
+        "s_rho": ("s_rho", S_RHO),
+        "Cs_r": ("s_rho", CS_R),
+        "h": (("eta_rho", "xi_rho"), H),
+    }
+    if include_hc:
+        coords["hc"] = HC
     ds = xr.Dataset(
         data_vars={"zeta": (("ocean_time", "eta_rho", "xi_rho"), zeta)},
-        coords={
-            **_grid_coords(HIS_TIMES),
-            "s_rho": ("s_rho", S_RHO),
-            "Cs_r": ("s_rho", CS_R),
-            "hc": HC,
-            "h": (("eta_rho", "xi_rho"), H),
-        },
+        coords=coords,
     )
     ds.to_netcdf(path)
 
@@ -107,21 +110,25 @@ def _write_qck_swrad(path, rng):
     ds.to_netcdf(path)
 
 
-def _write_a20_test_data(data_dir, rng):
+def _write_a20_test_data(data_dir, rng, include_hc=True):
     shape_3d = (len(HIS_TIMES), N_S, N_ETA, N_XI)
     _write_his_var(data_dir / "reduced_temp.nc", "temp",
-                    rng.uniform(2, 8, size=shape_3d), rng)
+                    rng.uniform(2, 8, size=shape_3d), rng, include_hc=include_hc)
     _write_his_var(data_dir / "reduced_salt.nc", "salt",
-                    rng.uniform(30, 35, size=shape_3d), rng)
-    _write_his_var(data_dir / "reduced_u_eastward.nc", "u_eastward",
-                    rng.uniform(-0.2, 0.2, size=shape_3d), rng)
-    _write_his_var(data_dir / "reduced_v_northward.nc", "v_northward",
-                    rng.uniform(-0.2, 0.2, size=shape_3d), rng)
+                    rng.uniform(30, 35, size=shape_3d), rng, include_hc=include_hc)
+    # File named reduced_u.nc/reduced_v.nc (not reduced_u_eastward.nc/
+    # reduced_v_northward.nc) - matches the real extract's convention
+    # (see pascal.scenarios::A20_HIS_FILE_NAMES); the variable *inside*
+    # is still named u_eastward/v_northward.
+    _write_his_var(data_dir / "reduced_u.nc", "u_eastward",
+                    rng.uniform(-0.2, 0.2, size=shape_3d), rng, include_hc=include_hc)
+    _write_his_var(data_dir / "reduced_v.nc", "v_northward",
+                    rng.uniform(-0.2, 0.2, size=shape_3d), rng, include_hc=include_hc)
     _write_his_var(data_dir / "reduced_w.nc", "w",
-                    rng.uniform(-0.001, 0.001, size=shape_3d), rng)
+                    rng.uniform(-0.001, 0.001, size=shape_3d), rng, include_hc=include_hc)
     _write_his_var(data_dir / "reduced_AKs.nc", "AKs",
-                    rng.uniform(0.0001, 0.01, size=shape_3d), rng)
-    _write_his_zeta(data_dir / "reduced_zeta.nc")
+                    rng.uniform(0.0001, 0.01, size=shape_3d), rng, include_hc=include_hc)
+    _write_his_zeta(data_dir / "reduced_zeta.nc", include_hc=include_hc)
     _write_dia_food(data_dir / "reduced_Chl_bc.nc", rng)
     _write_qck_swrad(data_dir / "reduced_swrad.nc", rng)
 
@@ -407,3 +414,28 @@ def test_real_land_mask_from_nan_zeta(tmp_path):
     land_flag, water_flag = env["land_binary_mask"]
     assert land_flag == 1.0
     assert water_flag == 0.0
+
+
+def test_a20_readers_work_when_source_files_have_no_hc(tmp_path):
+    """Some real A20 extracts carry their own `hc` variable in every
+    reduced_*.nc file (e.g. a20_test/a20_data's original 1995 extract),
+    others don't (e.g. the 2026-09-16 2019-2020 subset) - both
+    reader_ROMS_native's own depth calculation and
+    _a20_mld_from_density() need hc regardless, so
+    _inject_a20_grid_placeholders() injects A20_HC unconditionally
+    rather than only filling a gap. Confirms build_a20_readers() still
+    works, and mld still computes a real value, when no source file has
+    hc at all."""
+    rng = np.random.default_rng(0)
+    _write_a20_test_data(tmp_path, rng, include_hc=False)
+
+    readers = build_a20_readers(tmp_path)
+    physical = readers[0]
+
+    env, _ = physical.get_variables_interpolated(
+        ["mld", "temperature"], time=dt.datetime(1995, 1, 24, 6),
+        lon=np.array([14.1]), lat=np.array([69.1]), z=np.array([-5.0]),
+    )
+    assert np.isfinite(env["mld"][0])
+    assert 0 < env["mld"][0] < H[0, 0]
+    assert 2.0 <= env["temperature"][0] <= 8.0
