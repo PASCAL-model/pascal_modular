@@ -266,33 +266,54 @@ def build_cmems_advection_scenario(
     is given as a constant (not sourced from the biogeochemistry reader),
     per 2026-08-05 decision: the food1concentration alias to
     mass_concentration_of_chlorophyll_a_in_sea_water was confirmed
-    correctly *registered*, but returns 0.0 in practice via OpenDrift's
+    correctly *registered*, but returned 0.0 in practice via OpenDrift's
     interpolated fetch despite the raw underlying variable having real
-    data nearby - an unresolved OpenDrift/reader interpolation issue (see
-    pascal_benchmark's BENCHMARKING.md for the full writeup), to be
-    investigated separately. Using a constant here means only one live
-    CMEMS product needs retrieving for benchmarking.
+    data nearby - at the time, an unresolved OpenDrift/reader
+    interpolation issue (see pascal_benchmark's BENCHMARKING.md for the
+    full writeup).
 
-    IMPORTANT, found while wiring up the constant: this isn't only a
-    chlorophyll/BGC-reader problem. Even a plain ConstantReader-supplied
-    food1concentration reads back as 0.0 here when the live `physical`
-    CMEMS reader is *also* in the reader list - identical constant, same
-    settings, works correctly (reads back as 0.05) when ConstantReader is
-    the *only* reader. So the underlying bug is a broader interaction
-    between a live CMEMS reader and any other reader providing profile
-    variables, not something specific to the chl mapping - worth knowing
-    for the separate investigation. Population still collapses in this
-    scenario as a result; not something this constant swap fixes.
+    UPDATE 2026-09-16, root cause found and fixed upstream: this and the
+    next paragraph's symptom were the same bug, not two separate ones -
+    `Environment.get_environment()` only initialized `env_profiles` from
+    whichever reader group happened to run first, so any profile variable
+    *only* supplied by a later reader group (the bgc reader here; a
+    ConstantReader after a physical reader in build_advection_scenario()-
+    style setups) was silently dropped and replaced by PASCAL's fallback
+    constant instead of raising - see a20_test/README.md's "Bug 3" for the
+    full mechanism and the opendrift fork's fix (with regression tests).
+    Not yet re-verified here specifically: whether re-enabling the bgc
+    reader now correctly returns real chlorophyll data (the bug that
+    silently zeroed it is fixed), and separately, whether
+    mass_concentration_of_chlorophyll_a_in_sea_water needs a unit/scale
+    conversion to become PASCAL's food1concentration - that domain
+    question was never answered and still needs the model owner, fix or
+    no fix. food1concentration therefore stays a constant here for now;
+    re-enabling the bgc reader is a reasonable follow-up, not done as
+    part of this fix.
 
-    irradiance/pred1dens/pred1lightdep have no CMEMS equivalent at all:
-    pred1dens/pred1lightdep are meant to come from a separate, not-yet-
-    available precomputed netCDF (see input_pascal_cmems1/); irradiance
-    needs a real derivation from a surface radiation product (e.g. ERA5 via
-    the Copernicus Climate Data Store) not yet integrated. All three (plus
-    food1concentration) are given as constants here as an explicit
-    stand-in, using the same values already proven not to cause the
-    population collapse a food1concentration=0 fallback does (see
-    build_advection_scenario()).
+    Previously observed here too (now explained by the same root cause):
+    even a plain ConstantReader-supplied food1concentration read back as
+    0.0 when the live `physical` CMEMS reader was also in the reader list
+    (works correctly when ConstantReader is the *only* reader) - a second
+    reader group's profile variable, same bug. Whether population still
+    collapses in a live CMEMS run now that this is fixed hasn't been
+    re-tested (would need re-running a real CMEMS scenario, out of scope
+    for this pass) - flagged as follow-up.
+
+    irradiance/pred1dens/pred1lightdep have no CMEMS equivalent at all.
+    pred1dens now has a real (non-CMEMS) source - see
+    pascal.scenarios::build_pred1dens_readers(), real visual-predator-
+    density fields covering 1995-1997 (a20_test/pred_data) - already
+    wired into build_a20_advection_scenario() but not into this CMEMS
+    scenario; doing so is a reasonable follow-up given the two share a
+    domain (a20_test/pred_data's grid covers this scenario's default
+    start_location) but hasn't been done. pred1lightdep has no data
+    source at all; irradiance needs a real derivation from a surface
+    radiation product (e.g. ERA5 via the Copernicus Climate Data Store),
+    not yet integrated. All three (plus food1concentration) are given as
+    constants here as an explicit stand-in, using the same values already
+    proven not to cause the population collapse a food1concentration=0
+    fallback does (see build_advection_scenario()).
     """
     from netrc import netrc
 
@@ -381,8 +402,11 @@ def build_cmems_advection_scenario_from_file(
     which OpenDrift matches to x_/y_sea_water_velocity automatically.
 
     food1concentration/irradiance/pred1dens/pred1lightdep are constants
-    here for the same reason as build_cmems_advection_scenario(): no
-    working CMEMS source for them yet.
+    here for the same reasons as build_cmems_advection_scenario() (see
+    its docstring for the full detail, including the 2026-09-16 update on
+    the multi-reader-group bug that used to zero food1concentration/
+    pred1dens and is now fixed upstream, and pred1dens's new real - but
+    not yet wired in here - data source).
     """
     from opendrift.readers.reader_constant import Reader as ConstantReader
     from opendrift.readers.reader_netCDF_CF_generic import Reader as CFReader
