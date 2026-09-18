@@ -18,35 +18,14 @@ repositories:
   into a container and runs it, locally or on an HPC, from a YAML config.
 - [`pascal_benchmark`](../pascal_benchmark) — performance
   benchmarking/profiling harness for this package.
-
-## Package layout
-
-- `pascal.coupler` / `pascal.coupler_parallel` — `Pascal1D`/`PascalAdvection`
-  simulation classes (sequential and multiprocess-parallel).
-- `pascal.individual` — the `SuperIndividual` state and life-history logic.
-- `pascal.biology.*` — growth, survival, and vertical-migration submodels.
-- `pascal.data_logger` — spatial/temporal output aggregation and netCDF/CSV
-  writing.
-- `pascal.utils` — shared helpers (e.g. `load_locations_csv`).
-- `pascal.scenarios` — scenario builders that turn either synthetic
-  in-memory data or a CMEMS netCDF file into ready-to-run
-  `Pascal1D`/`PascalAdvection` kwargs. Used directly by `pascal_benchmark`,
-  and by `pascal_run`'s YAML-config glue (which overlays a run config's
-  `biology`/`population`/`time` sections on top of these).
-
-## Development setup
-
-```bash
-mamba env create -f environment.yml
-conda activate pascal_modular
-
-# Advection scenarios (PascalAdvection, coupler_parallel) depend on the
-# opendrift fork - install it as an editable sibling checkout too.
-pip install -e ../opendrift
-pip install -e .
-
-pytest
-```
+- [`pascal_docs`](../pascal_docs) — full documentation: a code-structure
+  tour of this package
+  ([`pascal_modular_structure.md`](../pascal_docs/pascal_modular_structure.md)),
+  the biological model
+  ([`biology_logic.md`](../pascal_docs/biology_logic.md)), worked examples,
+  an API reference, and dev setup
+  ([`CONTRIBUTING.md`](../pascal_docs/CONTRIBUTING.md)) covering all 5
+  repos.
 
 Values for genuinely calibrated constants in `pascal.scenarios`'s synthetic
 builders (critical molting mass thresholds, developmental coefficients) are

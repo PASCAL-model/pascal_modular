@@ -20,6 +20,12 @@ import xarray as xr
 from pascal.coupler import PascalAdvection
 from pascal.scenarios import build_cmems_advection_scenario_from_file
 
+# Reused by the bgc/era5 tests below - a smaller version of
+# _write_synthetic_cmems_file's own grid/time axis, since those files
+# don't need velocity/temperature at all.
+_BGC_ERA5_LATS = np.linspace(69.0, 70.0, 6)
+_BGC_ERA5_LONS = np.linspace(13.5, 14.5, 6)
+
 
 def _write_synthetic_cmems_file(path):
     """A minimal file with the same shape/attrs contract as a real
@@ -142,4 +148,149 @@ def test_full_run_against_local_file_completes(tmp_path, monkeypatch):
     output_dir = tmp_path / "cmems_file_run"
     assert (output_dir / "output_ps.nc").exists()
     assert (output_dir / "lifestats.csv").exists()
+    assert sim.population_size() > 0
+
+
+def _write_synthetic_bgc_file(path):
+    """A minimal file with the same shape/naming contract as a real
+    hpc/download_cmems_data.py BGC download (--dataset-id
+    cmems_mod_arc_bgc_anfc_ecosmo_P1D-m --variables chl): a depth-varying
+    `chl` variable with no CF standard_name (same convention as
+    thetao/mlotst above - build_cmems_advection_scenario_from_file()'s
+    bgc_variable relies on its own explicit standard_name_mapping, not
+    the file carrying one already)."""
+    times = pd.date_range("2022-01-01", periods=4, freq="D")
+    depths = np.array([0.0, 10.0, 50.0], dtype="float32")
+
+    rng = np.random.default_rng(1)
+    shape_3d = (len(times), len(depths), len(_BGC_ERA5_LATS), len(_BGC_ERA5_LONS))
+
+    ds = xr.Dataset(
+        data_vars={
+            "chl": (
+                ("time", "depth", "latitude", "longitude"),
+                rng.uniform(0.1, 3.0, size=shape_3d).astype("float32"),
+                {"units": "mg m-3"},
+            ),
+        },
+        coords={
+            "time": times,
+            "depth": ("depth", depths, {"standard_name": "depth", "axis": "Z",
+                                         "positive": "down"}),
+            "latitude": ("latitude", _BGC_ERA5_LATS,
+                         {"standard_name": "latitude", "units": "degrees_north"}),
+            "longitude": ("longitude", _BGC_ERA5_LONS,
+                          {"standard_name": "longitude", "units": "degrees_east"}),
+        },
+    )
+    ds.to_netcdf(path)
+
+
+def _write_synthetic_era5_file(path):
+    """A minimal file matching a real hpc/download_era5_data.py download:
+    genuinely 2D (surface-only, no depth dimension at all - ERA5 single-
+    level fields have none), `avg_sdswrf` with no CF standard_name (ERA5's
+    own CDS netCDF output doesn't reliably set one either, hence
+    era5_variable's explicit standard_name_mapping rather than relying
+    on discovery). Variable name confirmed 2026-09-17 against a real CDS
+    download - see pascal_docs' CMEMS+ERA5 example and Open Issues; the
+    older `msdwswrf` name this fixture used to use was never actually
+    correct."""
+    times = pd.date_range("2022-01-01", periods=16, freq="6h")
+
+    rng = np.random.default_rng(2)
+    shape_2d = (len(times), len(_BGC_ERA5_LATS), len(_BGC_ERA5_LONS))
+
+    ds = xr.Dataset(
+        data_vars={
+            "avg_sdswrf": (
+                ("time", "latitude", "longitude"),
+                rng.uniform(0.0, 500.0, size=shape_2d).astype("float32"),
+                {"units": "W m**-2"},
+            ),
+        },
+        coords={
+            "time": times,
+            "latitude": ("latitude", _BGC_ERA5_LATS,
+                         {"standard_name": "latitude", "units": "degrees_north"}),
+            "longitude": ("longitude", _BGC_ERA5_LONS,
+                          {"standard_name": "longitude", "units": "degrees_east"}),
+        },
+    )
+    ds.to_netcdf(path)
+
+
+def test_bgc_food1concentration_alias_resolves_from_raw_short_name(tmp_path):
+    cmems_file = tmp_path / "synthetic_cmems.nc"
+    bgc_file = tmp_path / "synthetic_bgc.nc"
+    _write_synthetic_cmems_file(cmems_file)
+    _write_synthetic_bgc_file(bgc_file)
+
+    kwargs = build_cmems_advection_scenario_from_file(
+        cmems_file, bgc_file=bgc_file,
+        n_super_individuals=5, start_location=(14.0, 69.5),
+        start_date=dt.datetime(2022, 1, 2),
+    )
+    physical, bgc, constants = kwargs["reader"]
+    assert "food1concentration" in bgc.variables
+
+    env, _ = bgc.get_variables_interpolated(
+        ["food1concentration"], time=dt.datetime(2022, 1, 2),
+        lon=np.array([14.0]), lat=np.array([69.5]), z=np.array([-5.0]),
+        profiles=["food1concentration"], profiles_depth=50,
+    )
+    # Real, file-derived value (uniform(0.1, 3.0) above) - not PascalDrift's
+    # fallback default (0).
+    assert 0.1 <= env["food1concentration"][0] <= 3.0
+
+
+def test_era5_irradiance_alias_resolves_from_raw_short_name(tmp_path):
+    cmems_file = tmp_path / "synthetic_cmems.nc"
+    era5_file = tmp_path / "synthetic_era5.nc"
+    _write_synthetic_cmems_file(cmems_file)
+    _write_synthetic_era5_file(era5_file)
+
+    kwargs = build_cmems_advection_scenario_from_file(
+        cmems_file, era5_file=era5_file,
+        n_super_individuals=5, start_location=(14.0, 69.5),
+        start_date=dt.datetime(2022, 1, 2),
+    )
+    physical, era5, constants = kwargs["reader"]
+    assert "irradiance" in era5.variables
+
+    env, _ = era5.get_variables_interpolated(
+        ["irradiance"], time=dt.datetime(2022, 1, 2, 6),
+        lon=np.array([14.0]), lat=np.array([69.5]), z=np.array([-5.0]),
+        profiles=["irradiance"], profiles_depth=50,
+    )
+    # Real, file-derived value (uniform(0.0, 500.0) above) - the fallback
+    # (0) is inside that range, so require strictly positive instead of
+    # just in-range to actually distinguish real data from the fallback.
+    assert env["irradiance"][0] > 0.0
+
+
+def test_full_run_with_bgc_and_era5_files_completes(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    cmems_file = tmp_path / "synthetic_cmems.nc"
+    bgc_file = tmp_path / "synthetic_bgc.nc"
+    era5_file = tmp_path / "synthetic_era5.nc"
+    _write_synthetic_cmems_file(cmems_file)
+    _write_synthetic_bgc_file(bgc_file)
+    _write_synthetic_era5_file(era5_file)
+
+    kwargs = build_cmems_advection_scenario_from_file(
+        cmems_file, bgc_file=bgc_file, era5_file=era5_file,
+        n_super_individuals=10,
+        n_virtual_per_super=1000,
+        duration_years=0.005,
+        seeding_rate=5,
+        start_location=(14.0, 69.5),
+        start_date=dt.datetime(2022, 1, 1),
+        headless="cmems_bgc_era5_run",
+    )
+    sim = PascalAdvection(**kwargs)
+    sim.run()
+
+    output_dir = tmp_path / "cmems_bgc_era5_run"
+    assert (output_dir / "output_ps.nc").exists()
     assert sim.population_size() > 0

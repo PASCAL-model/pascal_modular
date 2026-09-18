@@ -1,3 +1,12 @@
+"""Output aggregation and netCDF writing for PASCAL runs.
+
+Owns two kinds of output: gridded spatial/temporal population state
+(:meth:`OutputLogger.log_spatial`, written by :meth:`OutputLogger.write_spatial`)
+and scalar diapause/direct-development event counters
+(:meth:`OutputLogger.add_ddev`/``add_den``/``add_dex``, not currently
+written to disk anywhere - see :class:`OutputLogger`'s docstring).
+"""
+
 import numpy as np
 import netCDF4 as nc
 import os
@@ -10,7 +19,44 @@ DEFAULT_SAVE = {'nvindividuals':{"units":"no. of individuals", "longname":"estim
                 'metabolicrate':{"units":"gC", "longname":"estimated stage-, time- and space-specific biomass of Calanus finmarchicus"}}
 
 class OutputLogger(object):
+    """Accumulates and writes one PASCAL run's output. Constructed once per
+    run by :class:`pascal.coupler.PascalSimulation` and passed down to
+    every :class:`~pascal.individual.SuperIndividual` so diapause/
+    direct-development events can be logged as they happen.
+
+    Notes
+    -----
+    ``self.ddev``/``self.den``/``self.dex`` (direct-development and
+    diapause entry/exit counters, filled by :meth:`add_ddev`/:meth:`add_den`/
+    :meth:`add_dex`) and ``self.genome_log`` (filled by
+    :meth:`log_evolvable`, which is itself never called anywhere in this
+    codebase) are accumulated in memory but have no corresponding
+    ``write_*`` method - only :meth:`write_spatial` actually writes to
+    disk. ``write_evolvable`` exists as a stub (``pass``, "to be
+    implemented"). Whether this is an intentional work-in-progress or an
+    oversight is unclear from the code alone.
+    """
+
     def __init__(self, outputfolder, total_timesteps, output_grid, devstages = 13, no_evolvable=8, save_spatial=DEFAULT_SAVE):
+        """
+        Parameters
+        ----------
+        outputfolder : str
+            Directory to write output into; created if missing.
+        total_timesteps : int
+            Number of model timesteps this run will take - preallocates
+            the ``ddev``/``den``/``dex``/``genome_log`` arrays' time axis.
+        output_grid : dict
+            Spatial/temporal output grid (``lon``/``lat``/``depth``/``time``)
+            as built by ``PascalSimulation.prep_outputgrid()``.
+        devstages : int, optional
+            Number of developmental-stage bins in gridded output.
+        no_evolvable : int, optional
+            Number of evolvable genes tracked by ``genome_log``.
+        save_spatial : dict, optional
+            ``{variable_name: {"units", "longname"}}`` for each spatial
+            variable to log/write; defaults to ``DEFAULT_SAVE``.
+        """
         # These are split by developmental stages (up to 13 with 12 (13) being female (male) at stage zz)
         self.currentsubpopulation = 'all' # At the moment not logged by subpopulation
         self.total_mass = [] 
@@ -46,6 +92,11 @@ class OutputLogger(object):
         self.outputfile = f'./{outputfolder}/output_ps.nc'
 
     def prep_grid(self):
+        """Derive ``min/max_lon``/``min/max_lat`` and grid cell resolution
+        from ``self.output_grid``, for use by :meth:`resolve_spatial`.
+        A single-point grid (min == max) gets a resolution of 1 (unused,
+        since :meth:`resolve_spatial` clamps single-point grids to that
+        one cell regardless)."""
         self.min_lon = np.min(self.output_grid['lon'])
         self.max_lon = np.max(self.output_grid['lon'])
         self.min_lat = np.min(self.output_grid['lat'])
@@ -61,18 +112,86 @@ class OutputLogger(object):
             self.lat_res = self.output_grid['lat'][1] - self.output_grid['lat'][0]
 
     def add_ddev(self, data, col):
+        """Accumulate one direct-development event (a non-diapausing
+        individual reaching adulthood) into ``self.ddev``.
+
+        Parameters
+        ----------
+        data : dict
+            From :meth:`pascal.individual.SuperIndividual.get_log_data`.
+        col : int
+            0 for genetically-determined, 1 for environmentally-determined
+            (bottom-depth-constrained) - see
+            :meth:`~pascal.individual.SuperIndividual.diapause0`.
+
+        Notes
+        -----
+        **Verified bug**: references ``self.current_timestep``, which is
+        never set anywhere on this class - calling this raises
+        ``AttributeError``. Not fixed here (see
+        :meth:`~pascal.individual.SuperIndividual.get_log_data`'s
+        docstring for the related bug in its caller).
+        """
         for var, add_data in data.items():
             self.ddev[var][self.current_timestep, col] += add_data
 
     def add_den(self, data, col1, col2):
+        """Accumulate one diapause-entry event into ``self.den``.
+
+        Parameters
+        ----------
+        data : dict
+            From :meth:`pascal.individual.SuperIndividual.get_log_data`.
+        col1 : int
+            0 for CIV, 1 for CV.
+        col2 : int
+            Diapause mode (0: "true" diapause, 1: "active" diapause - see
+            :meth:`~pascal.individual.SuperIndividual.diapause0`).
+
+        Notes
+        -----
+        Same ``self.current_timestep`` bug as :meth:`add_ddev`.
+        """
         for var, add_data in data.items():
             self.den[var][self.current_timestep, col1, col2] += add_data
 
     def add_dex(self, data, col1, col2):
+        """Accumulate one diapause-exit event into ``self.dex``.
+
+        Parameters
+        ----------
+        data : dict
+            From :meth:`pascal.individual.SuperIndividual.get_log_data`.
+        col1 : int
+            0 for CIV, 1 for CV.
+        col2 : int
+            Always 0 in current call sites (see
+            :meth:`~pascal.individual.SuperIndividual.diapause1`) - a
+            second mode value is never passed, unlike :meth:`add_den`.
+
+        Notes
+        -----
+        Same ``self.current_timestep`` bug as :meth:`add_ddev`.
+        """
         for var, add_data in data.items():
             self.dex[var][self.current_timestep, col1, col2] += add_data
 
     def log_spatial(self, cxyz, data_dict):
+        """Grid one timestep's per-individual spatial contributions (via
+        :meth:`resolve_spatial`) and append the result to
+        ``self.spatial_output``, for later writing by
+        :meth:`write_spatial`.
+
+        Parameters
+        ----------
+        cxyz : numpy.ndarray
+            Shape ``(n_individuals, 4)``: stage-column, lon, lat, depth-index
+            per active individual (built by
+            ``pascal.coupler.PascalSimulation.log_spatial``).
+        data_dict : dict
+            ``{variable: array of per-individual values}``, one entry per
+            ``self.spatial_var_list`` variable.
+        """
         # This is done at the coupler level as it varies based on the forcing (1-D or spatially resolved)
         # TODO - write at each timestep rather than dumping to a dict
         resolved_dict = self.resolve_spatial(cxyz, data_dict)
@@ -80,10 +199,37 @@ class OutputLogger(object):
            data.append(resolved_dict[varname])
 
     def log_evolvable(self, genomes, timestep):
+        """Record the population's per-gene mean/std into
+        ``self.genome_log`` at ``timestep``.
+
+        Notes
+        -----
+        Never called anywhere in this codebase, and ``genome_log`` has no
+        corresponding write method either (see this class's docstring) -
+        appears to be unused/incomplete rather than exercised.
+        """
         self.genome_log[timestep, :, 0] = np.mean(genomes)
         self.genome_log[timestep, :, 1] = np.std(genomes)
 
     def resolve_spatial(self, cxyz, data_dict):
+        """Bin one timestep's per-individual contributions onto the
+        ``(devstage, lon, lat, depth)`` output grid via ``np.add.at``
+        (correctly accumulating when multiple individuals fall in the same
+        cell). Out-of-grid lon/lat are clamped to the grid's min/max rather
+        than dropped.
+
+        Parameters
+        ----------
+        cxyz : numpy.ndarray
+            Shape ``(n, 4)``: stage-column, lon, lat, depth-index.
+        data_dict : dict
+            ``{variable: array of length n}``.
+
+        Returns
+        -------
+        dict
+            ``{variable: ndarray of shape (devstages, n_lon, n_lat, n_depth)}``.
+        """
         # nb: vectorized replacement for what used to be a nested Python loop
         # over every individual, wrapped in a "for d in devstages: if any
         # individual is in stage d: <loop over ALL individuals again>" outer
@@ -129,6 +275,11 @@ class OutputLogger(object):
         return gridded_data
 
     def write_spatial(self):
+        """Write accumulated gridded spatial output (``self.spatial_output``,
+        filled over the run by :meth:`log_spatial`) to
+        ``<outputfolder>/output_ps.nc`` (NETCDF4_CLASSIC), one variable per
+        ``self.spatial_atts`` entry, dimensioned
+        ``(time, devstage, lon, lat, depth)``."""
         #file1: space-, time-, and tage-specific population size (datatype = np.int32)
         #-----------------------------------------------------------------------------
         #nb: dimensions: <stage> <longitude> <latitude> <depth> <time>

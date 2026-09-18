@@ -98,9 +98,11 @@ def build_1d_reader(time_len, depthrange=DEFAULT_DEPTHRANGE, rng=None):
     """Synthetic single-water-column environment for Pascal1D.
 
     Shapes follow Pascal1D.update_environment's expectations:
-      - profile variables: [time, depth, n_index]
-      - 'mld' (not depth-resolved): [time, n_index]
-      - 'z': depth levels, static (no leading time dim)
+
+    - profile variables: [time, depth, n_index]
+    - 'mld' (not depth-resolved): [time, n_index]
+    - 'z': depth levels, static (no leading time dim)
+
     n_index is 1 because Pascal1D pins every super-individual to the same
     (only) spatial column.
     """
@@ -141,7 +143,7 @@ def build_1d_scenario(
     seed=0,
     headless="bench_run",
 ):
-    """Return kwargs ready to pass to coupler.Pascal1D(**kwargs)."""
+    """Return kwargs ready to pass to coupler.Pascal1D(``**kwargs``)."""
     rng = np.random.default_rng(seed)
     np.random.seed(seed)  # the model itself uses the legacy global RNG
 
@@ -176,8 +178,8 @@ def build_advection_scenario(
     seed=0,
     headless="bench_run",
 ):
-    """Return kwargs ready to pass to coupler.PascalAdvection(**kwargs)
-    (or coupler_parallel.PascalAdvectionParallel(**kwargs)).
+    """Return kwargs ready to pass to coupler.PascalAdvection(``**kwargs``)
+    (or coupler_parallel.PascalAdvectionParallel(``**kwargs``)).
 
     Unlike Pascal1D (where every super-individual shares a single
     environment_index=0, so environment_profiles arrays only ever have one
@@ -257,9 +259,12 @@ def build_cmems_advection_scenario(
     irradiance_constant=0.1,
     pred_data_dir=None,
     pred_variable="vpdens",
+    use_bgc_reader=False,
+    era5_file=None,
+    era5_variable="avg_sdswrf",
     headless="bench_run",
 ):
-    """Return kwargs ready to pass to coupler.PascalAdvection(**kwargs),
+    """Return kwargs ready to pass to coupler.PascalAdvection(``**kwargs``),
     backed by live Copernicus Marine (CMEMS) physical data instead of a
     synthetic reader - for checking the realistic 3D deployment path
     specifically, not for routine/repeatable benchmarking (this hits a
@@ -271,11 +276,13 @@ def build_cmems_advection_scenario(
     PASCAL's required_variables (pascal_drift.py) use short internal names
     that don't match CMEMS's real CF standard names, so nothing gets
     matched and everything silently falls back to constant defaults unless
-    aliased. Confirmed mapping (2026-08-04, reviewed):
+    aliased. Confirmed mapping (2026-08-04, reviewed)::
+
         temperature -> sea_water_temperature       (physical reader)
         mld         -> ocean_mixed_layer_thickness (physical reader)
-    x/y_sea_water_velocity need no alias - OpenDrift's reader machinery
-    already rotates eastward/northward -> x/y internally.
+
+    ``x``/``y_sea_water_velocity`` need no alias - OpenDrift's reader
+    machinery already rotates eastward/northward to x/y internally.
     ocean_vertical_diffusivity/land_binary_mask need no alias either -
     both handled via tracker_config below (a parameterized diffusivity
     model and OpenDrift's auto-landmask), not reader lookup.
@@ -325,8 +332,50 @@ def build_cmems_advection_scenario(
     re-tested (would need re-running a real CMEMS scenario, out of scope
     for this pass) - flagged as follow-up.
 
-    irradiance/pred1dens have no CMEMS equivalent at all. pred1dens now
-    has a real (non-CMEMS) source - see pascal.scenarios::
+    UPDATE 2026-09-16: the bgc reader is now wired in too - pass
+    use_bgc_reader=True to add CMEMSReader("cmems_mod_arc_bgc_anfc_ecosmo_P1D-m")
+    to the reader list (aliasing food1concentration ->
+    mass_concentration_of_chlorophyll_a_in_sea_water, same as physical's
+    temperature/mld). Off by default - this is a new, separate live CMEMS
+    product (another rate-limited network dependency, another dataset
+    that may not cover every date/location the physical product does),
+    so existing callers aren't affected unless they opt in. **Not
+    verified against a live run in this session**: attempted to test it
+    directly against the real CMEMS BGC service, but the credentials in
+    this environment's ~/.netrc were rejected by
+    copernicusmarine.login(check_credentials_valid=True) ("No
+    credentials found" / login check False) - a stale/invalid password,
+    not a code issue, but it means this specific path is implemented
+    against the same pattern already confirmed working for `physical`
+    above, not independently re-confirmed live. Re-check with valid
+    credentials before relying on it for a real run.
+
+    irradiance has no CMEMS equivalent at all - it comes from ERA5 (a
+    completely different service, the Copernicus *Climate Data Store*,
+    not Copernicus *Marine*) instead. UPDATE 2026-09-16: wired in via
+    era5_file - pass a local netCDF downloaded by
+    pascal_run's hpc/download_era5_data.py (see that script's docstring)
+    to use real irradiance data instead of the flat irradiance_constant
+    fallback; era5_variable (default "avg_sdswrf", W/m² - matching how
+    the A20 pathway already treats ROMS's raw swrad the same way, not
+    narrowed to the PAR band specifically) controls which variable in
+    that file aliases to irradiance. No live-streaming option exists for
+    this one, unlike physical/bgc above - CDS is a request-then-download
+    batch service, not a per-timestep query API, so file-based is the
+    only integration that makes sense here.
+
+    UPDATE 2026-09-17, verified against a real CDS download: the
+    variable's short name in an actual `reanalysis-era5-single-levels`
+    netCDF download is `avg_sdswrf` ("Time-mean surface downward
+    short-wave radiation flux"), not `msdwswrf` as originally assumed -
+    CDS's current GRIB->netCDF conversion (via cfgrib) names it
+    differently than the older "classic" API's short name did.
+    era5_variable's default was wrong until this fix, now corrected and
+    confirmed against a real downloaded file (see pascal_docs' CMEMS+ERA5
+    example). Units confirmed W/m**2 as expected, so no scaling change,
+    just the name.
+
+    pred1dens now has a real (non-CMEMS) source - see pascal.scenarios::
     build_pred1dens_readers(), real visual-predator-density fields
     covering 1995-1997 (a20_test/pred_data), whose domain (lat 65-76N,
     lon 5-20E) covers this scenario's default start_location too.
@@ -344,12 +393,11 @@ def build_cmems_advection_scenario(
     keeps the constant behavior unless pred_data_dir points at a
     dataset that does cover the run's actual dates.
 
-    irradiance needs a real derivation from a surface radiation product
-    (e.g. ERA5 via the Copernicus Climate Data Store), not yet
-    integrated. Both irradiance and food1concentration are given as
-    constants here as an explicit stand-in, using the same values
-    already proven not to cause the population collapse a
-    food1concentration=0 fallback does (see build_advection_scenario()).
+    food1concentration/irradiance/pred1dens are still given as constants
+    by default (the values already proven not to cause the population
+    collapse a food1concentration=0 fallback does - see
+    build_advection_scenario()) - all three now have a real, opt-in
+    alternative above, but none is on by default.
 
     pred1lightdep (formerly one of these constants) has been removed:
     it never appeared in any actual PASCAL model code, only in
@@ -360,6 +408,7 @@ def build_cmems_advection_scenario(
 
     from opendrift.readers.reader_constant import Reader as ConstantReader
     from opendrift.readers.reader_copernicusmarine import Reader as CMEMSReader
+    from opendrift.readers.reader_netCDF_CF_generic import Reader as CFReader
 
     np.random.seed(seed)
 
@@ -371,6 +420,17 @@ def build_cmems_advection_scenario(
     physical = CMEMSReader("cmems_mod_arc_phy_anfc_6km_detided_P1D-m")
     _alias_reader_variable(physical, "temperature", "sea_water_temperature")
     _alias_reader_variable(physical, "mld", "ocean_mixed_layer_thickness")
+
+    extra_readers = []
+    if use_bgc_reader:
+        bgc = CMEMSReader("cmems_mod_arc_bgc_anfc_ecosmo_P1D-m")
+        _alias_reader_variable(bgc, "food1concentration",
+                                "mass_concentration_of_chlorophyll_a_in_sea_water")
+        extra_readers.append(bgc)
+    if era5_file is not None:
+        extra_readers.append(CFReader(
+            str(era5_file), standard_name_mapping={era5_variable: "irradiance"},
+        ))
 
     pred_readers = (
         build_pred1dens_readers(pred_data_dir, variable=pred_variable)
@@ -397,7 +457,7 @@ def build_cmems_advection_scenario(
         "nsupindividuals": n_super_individuals,
         "nvindividualspersupindividual": n_virtual_per_super,
         "global_settings": build_global_settings(stochastic=stochastic),
-        "reader": [physical] + pred_readers + [constants],
+        "reader": [physical] + extra_readers + pred_readers + [constants],
         "timestep": timestep,
         "start_date": start_date,
         "duration": duration_years,
@@ -428,6 +488,10 @@ def build_cmems_advection_scenario_from_file(
     irradiance_constant=0.1,
     pred_data_dir=None,
     pred_variable="vpdens",
+    bgc_file=None,
+    bgc_variable="chl",
+    era5_file=None,
+    era5_variable="avg_sdswrf",
     headless="bench_run",
 ):
     """Same scientific setup as build_cmems_advection_scenario(), but reads
@@ -444,8 +508,8 @@ def build_cmems_advection_scenario_from_file(
     reader_netCDF_CF_generic.Reader takes standard_name_mapping directly,
     so the thetao/mlotst -> temperature/mld rename happens cleanly at
     construction time. vxo/vyo need no mapping: confirmed 2026-08-04 they
-    already carry CF standard_names eastward_/northward_sea_water_velocity,
-    which OpenDrift matches to x_/y_sea_water_velocity automatically.
+    already carry CF standard_names ``eastward_/northward_sea_water_velocity``,
+    which OpenDrift matches to ``x_/y_sea_water_velocity`` automatically.
 
     food1concentration/irradiance/pred1dens are constants here for the
     same reasons as build_cmems_advection_scenario() (see
@@ -454,6 +518,27 @@ def build_cmems_advection_scenario_from_file(
     pred1dens and is now fixed upstream). pred1dens's real data source is
     wired in the same way too - see that docstring's 2026-09-16 update on
     pred_data_dir/pred_variable.
+
+    UPDATE 2026-09-16: food1concentration and irradiance each gained a
+    real, opt-in, file-based alternative too, same pattern as pred1dens.
+    bgc_file, if given, points at a local BGC netCDF downloaded the same
+    way as cmems_file (pascal_run's hpc/download_cmems_data.py, just with
+    --dataset-id cmems_mod_arc_bgc_anfc_ecosmo_P1D-m --variables chl -
+    see that script's docstring); bgc_variable (default "chl", the raw
+    variable name the download produces, not a CF standard_name - the
+    file-based reader needs the raw name here the same way physical's
+    thetao/mlotst do above, unlike the live bgc reader in
+    build_cmems_advection_scenario() which aliases via standard_name
+    since copernicusmarine.open_dataset() sets that automatically)
+    aliases directly to food1concentration. era5_file/era5_variable work
+    the same way for irradiance - see build_cmems_advection_scenario()'s
+    docstring for why ERA5/CDS has no live-streaming equivalent and for
+    this session's verification caveats on both bgc_file and era5_file
+    (bgc: implemented against the same pattern already confirmed working
+    for the physical file above, but not independently re-tested live
+    this session - this environment's CMEMS credentials were rejected;
+    era5: no CDS credentials configured at all, so only unit-tested
+    against a synthetic fixture, not a real download).
     """
     from opendrift.readers.reader_constant import Reader as ConstantReader
     from opendrift.readers.reader_netCDF_CF_generic import Reader as CFReader
@@ -464,6 +549,17 @@ def build_cmems_advection_scenario_from_file(
         str(cmems_file),
         standard_name_mapping={"thetao": "temperature", "mlotst": "mld"},
     )
+
+    extra_readers = []
+    if bgc_file is not None:
+        extra_readers.append(CFReader(
+            str(bgc_file),
+            standard_name_mapping={bgc_variable: "food1concentration"},
+        ))
+    if era5_file is not None:
+        extra_readers.append(CFReader(
+            str(era5_file), standard_name_mapping={era5_variable: "irradiance"},
+        ))
 
     pred_readers = (
         build_pred1dens_readers(pred_data_dir, variable=pred_variable)
@@ -490,7 +586,7 @@ def build_cmems_advection_scenario_from_file(
         "nsupindividuals": n_super_individuals,
         "nvindividualspersupindividual": n_virtual_per_super,
         "global_settings": build_global_settings(stochastic=stochastic),
-        "reader": [physical] + pred_readers + [constants],
+        "reader": [physical] + extra_readers + pred_readers + [constants],
         "timestep": timestep,
         "start_date": start_date,
         "duration": duration_years,
@@ -749,7 +845,7 @@ def _build_a20_swrad_reader(data_dir):
 
 def build_pred1dens_readers(pred_data_dir, variable="vpdens"):
     """One reader per year subfolder's netCDF file under pred_data_dir
-    (pred_data_dir/<year>/*.nc - the layout of a20_test/pred_data),
+    (``pred_data_dir/<year>/*.nc`` - the layout of a20_test/pred_data),
     aliasing `variable` (a raw netCDF variable name, not a CF
     standard_name - e.g. "vpdens", same convention as
     build_cmems_advection_scenario_from_file's thetao/mlotst aliasing)
@@ -877,7 +973,7 @@ def build_a20_advection_scenario(
     pred_variable="vpdens",
     headless="bench_run",
 ):
-    """Return kwargs ready to pass to coupler.PascalAdvection(**kwargs),
+    """Return kwargs ready to pass to coupler.PascalAdvection(``**kwargs``),
     backed by real A20 ROMS/ECOSMO output (data_dir - see build_a20_readers()
     for the expected file layout) instead of a synthetic reader.
 

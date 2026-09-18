@@ -79,6 +79,24 @@ DEFAULT_DEBUG_VARIABLES = (
 )
 
 class SuperIndividual(object):
+    """A single PASCAL super-individual: one simulated *Calanus* copepod
+    representing ``nindividuals`` real (virtual) individuals that share an
+    identical life history.
+
+    Holds all per-individual biological state (developmental stage, body
+    mass, diapause state, genome, fecundity, ...) and the methods that
+    advance it one timestep at a time (:meth:`update_lifestage` and its
+    stage-dispatch tree). A super-individual is tied 1:1 to one element/slot
+    in the owning :class:`~pascal.coupler.PascalSimulation`'s particle
+    tracker via ``environment_index`` - that slot supplies its position and
+    the environment data it reads each timestep (see
+    :meth:`get_profile`/:meth:`get_zi`).
+
+    Instances are created and destroyed by
+    :class:`~pascal.coupler.PascalSimulation` (``seed()``/``respawn()``/
+    ``clean_dead()``), not typically constructed directly by user code.
+    """
+
     def __init__(
         self,
         global_settings,
@@ -95,6 +113,55 @@ class SuperIndividual(object):
         unique_id=None,
         origin=None,
     ):
+        """
+        Parameters
+        ----------
+        global_settings : dict
+            Shared run-wide parameters (biological rate constants, the
+            vertical ``depthrange`` grid, mortality/fecundity ceilings,
+            ``stochastic`` flag, ...) - the same object is shared by
+            reference across every individual in a run.
+        diapausedepth : float
+            Initial value for ``self.diapausedepth`` (later overwritten by
+            :func:`pascal.biology.vertical_migration.diapausedepthselection`
+            once an individual actually enters diapause).
+        environment, environment_profiles : dict-like
+            Current-timestep environment data (scalar and depth-profile
+            variables respectively), as produced by the owning
+            simulation's ``update_environment()``. Re-pointed to the
+            current timestep's objects every step by
+            :meth:`pascal.coupler.PascalSimulation.sync_environment_references`,
+            not re-fetched here.
+        environment_index : int
+            This individual's slot index into the particle tracker's
+            element arrays (position, origin, ...).
+        eggmass : float, optional
+            Starting structural mass (also the egg mass used for fecundity
+            accounting elsewhere).
+        nindividuals : int, optional
+            Initial virtual-individual count this super-individual
+            represents.
+        genes : dict-like, optional
+            Explicit genome (one value in [0, 1] per entry of
+            ``EXPECTED_GENES``). If ``None``, a fresh genome is drawn
+            (random if ``global_settings["stochastic"]``, else a fixed
+            0.2 for every gene).
+        cxthreshold, muthreshold : float, optional
+            Per-gene crossover/mutation probability thresholds used by
+            :meth:`get_child_genome` when this individual mates.
+        datalogger : pascal.data_logger.OutputLogger, optional
+            If given, diapause-entry/exit and direct-development events are
+            logged to it (see :meth:`diapause0`/:meth:`diapause1`).
+        unique_id : int, optional
+            Identifier used by the owning simulation's lifetime-stats
+            bookkeeping; not used internally by this class.
+        origin : tuple of (float, float), optional
+            ``(lon, lat)`` this individual is considered to have started
+            from, used to rescue it back to safety if its tracker element
+            would otherwise leave the model domain (see
+            ``pascal_drift.py::PascalDrift.remove_deactivated_elements``).
+            Defaults to ``(None, None)``.
+        """
         # these are reflective of individual states and vary during the lifespan of super individuals depending on the individual-environment interactions and internal processes (e.g., hardcoded strategies)
         self.global_settings = global_settings
         if "stochastic" not in self.global_settings.keys():
@@ -243,6 +310,8 @@ class SuperIndividual(object):
         self.origin_lon, self.origin_lat = origin if origin is not None else (None, None)
 
     def update_vert(self):
+        """Recompute ``self.zidx`` (the index into ``depthrange`` nearest
+        ``self.zpos``) after a vertical-position update."""
         self.zidx = np.argmin(abs(self.global_settings["depthrange"] - self.zpos))
         # maxdepth/mindepth are set externally by
         # coupler.py::sync_environment_references(), once per timestep for
@@ -253,6 +322,30 @@ class SuperIndividual(object):
         # runtime by itself (see BENCHMARKING.md).
 
     def get_profile(self, var):
+        """Return this individual's full depth profile for environment
+        variable ``var`` at its current environment slot, interpolated onto
+        ``global_settings["depthrange"]`` if the reader's own depth levels
+        differ.
+
+        Parameters
+        ----------
+        var : str
+            Name of a profile environment variable (e.g. ``"temperature"``,
+            ``"food1concentration"``, ``"irradiance"``, ``"pred1dens"`` -
+            see ``PROFILE_ENVIRONMENT_VARIABLES``).
+
+        Returns
+        -------
+        numpy.ndarray
+            One value per depth level of ``global_settings["depthrange"]``.
+
+        Notes
+        -----
+        Results are cached per individual per timestep (cleared by
+        :meth:`pascal.coupler.PascalSimulation.sync_environment_references`)
+        since the same variable is commonly re-requested more than once
+        per timestep.
+        """
         # Cached per individual per timestep (cleared by
         # coupler.py::sync_environment_references()) since the same var is
         # commonly re-requested more than once per timestep (e.g.
@@ -280,13 +373,44 @@ class SuperIndividual(object):
         return result
 
     def get_zi(self, var):
+        """Return this individual's environment variable ``var`` at its
+        current vertical position (``self.zidx``) only, via
+        :meth:`get_profile`.
+
+        Parameters
+        ----------
+        var : str
+            Name of a profile environment variable.
+
+        Returns
+        -------
+        float
+        """
         return self.get_profile(var)[self.zidx]
 
     def update_lifestage(self):
+        """Advance this individual by one timestep: run its stage-specific
+        growth/development/vertical-migration logic
+        (:meth:`run_stage_transition`), then its mortality/death check
+        (:meth:`apply_mortality_and_deathcheck`).
+
+        Not used by :class:`~pascal.coupler.PascalSimulation` directly -
+        the coupler calls the two steps separately so the mortality step
+        can be batched (vectorized) across all individuals at once; see
+        :meth:`pascal.coupler.PascalSimulation.apply_mortality_and_deathcheck_batch`.
+        """
         self.run_stage_transition()
         self.apply_mortality_and_deathcheck()
 
     def run_stage_transition(self):
+        """Dispatch to this individual's stage-specific growth/development/
+        vertical-migration method based on ``self.developmentalstage``:
+        :meth:`stage_lt_2` (egg, NI, NII), :meth:`stage_3_9`
+        (NIII-CIII), :meth:`stage_10_11` (CIV/CV, which further dispatch to
+        :meth:`diapause0`/:meth:`diapause1`/:meth:`diapause2`), or
+        :meth:`stage_12` (adult female/male). A dead or not-yet-seeded
+        individual (``developmentalstage`` outside these ranges) is a
+        no-op."""
         # the growth & development, survival and reproductive simulation happens within this if() condition based on developmental stage
         # no else() condition is written, as the loop skips if a super indivdual is dead or unseeded/uninitialized
 
@@ -314,6 +438,16 @@ class SuperIndividual(object):
             self.stage_12()
 
     def apply_mortality_and_deathcheck(self):
+        """Apply stage->2 predation/background mortality
+        (:meth:`apply_dsc2_mortality`) to shrink ``nvindividuals``, then
+        mark ``self.lifestatus = 0`` if this individual has hit any of the
+        three death conditions: ``nvindividuals`` at or below
+        ``global_settings["virtualindividualthrehold"]``, ``age`` at or
+        past ``ageceiling``, or ``totalfecundity`` at or past
+        ``fecundityceiling``. A dead flag here does not remove the
+        individual - see
+        :meth:`pascal.coupler.PascalSimulation.clean_dead`.
+        """
         # Split out from update_lifestage() so coupler.py can batch this
         # part (uniform, branch-simple math shared by every stage>2
         # individual) across many individuals in one vectorized pass
@@ -341,6 +475,13 @@ class SuperIndividual(object):
             self.lifestatus = 0
 
     def stage_lt_2(self):
+        """Advance one timestep for non-feeding early stages (Egg, NI, NII:
+        ``developmentalstage`` 0-2): passive vertical positioning
+        (:func:`~pascal.biology.vertical_migration.verticalmigration_dsc0`),
+        temperature-only growth/development
+        (:func:`~pascal.biology.growth.growthdevelopmentmetabolism_dsc0`),
+        stage advancement once age reaches the stage's developmental time,
+        and mortality (:meth:`apply_dsc0_mortality`)."""
         # eggs and non-feeding naupliar stages (Egg-NII)
         self.update_vert()
         self.zpos, self.zidx = vm.verticalmigration_dsc0(
@@ -385,6 +526,16 @@ class SuperIndividual(object):
         self.apply_dsc0_mortality()
 
     def stage_3_9(self):
+        """Advance one timestep for feeding, non-energy-storing stages
+        (NIII-CIII: ``developmentalstage`` 3-9): active vertical migration
+        (:meth:`apply_dsc1_verticalmigration`), food/temperature-dependent
+        growth (:func:`~pascal.biology.growth.growthanddevelopment_dsc1`),
+        stage advancement once structural mass reaches the current
+        critical molting mass (:meth:`get_currentcmm`), and predation/
+        background mortality
+        (:func:`~pascal.biology.survival.mortalityrisk_dsc1`, applied
+        directly here rather than via :meth:`apply_dsc1_mortality` - see
+        that method's docstring)."""
         # feeding but non-energy-storing stages (NIII-CIII)
         self.update_vert()
         maxdistance, traveldistance = self.apply_dsc1_verticalmigration()
@@ -428,6 +579,13 @@ class SuperIndividual(object):
         self.nvindividuals = int(self.nvindividuals * (1.00 - currentmortalityrisk))
 
     def stage_10_11(self):
+        """Advance one timestep for CIV/CV (``developmentalstage`` 10 or
+        11): on first arrival, randomly commits this individual to a
+        diapause strategy (``diapausestrategy``: 1 with probability
+        ``genome.a6_diapauseprobability``, else 0 for direct development),
+        then dispatches on ``diapausestate`` to :meth:`diapause0`
+        (pre-diapause), :meth:`diapause1` (in diapause) or :meth:`diapause2`
+        (post-diapause)."""
         # if the diapause strategy is undefined (-1: typical for newly seeded/spawned super individual arriving at civ/cv for the first time), define the diapause strategy (0, 1)
         # nb:the diapause strategy is linked to the diapause probability 'gene'
         if self.diapausestrategy == -1:
@@ -450,6 +608,19 @@ class SuperIndividual(object):
             print("Warning undefined diapause stage!!!")
 
     def stage_12(self):
+        """Advance one timestep for adults (``developmentalstage`` 12):
+        determines sex on first arrival (50/50), does vertical migration
+        (:meth:`apply_dsc2_verticalmigration`), then sex-specific
+        growth/reproduction - males degrow with no feeding
+        (:meth:`apply_dsc3_male_growthdevel`); females feed and channel
+        growth into reproductive allocation once inseminated
+        (:meth:`apply_dsc2_growthdevel`), accumulating
+        ``potentialfecundity`` once enough reserve has been allocated to
+        cover at least one ``eggmass``. Note that unlike the other
+        ``stage_*``/``diapause*`` methods, this one does not itself call
+        a mortality method - mortality for adults is applied only via
+        :meth:`apply_mortality_and_deathcheck`
+        (:meth:`apply_dsc2_mortality`)."""
         # adult stages (male and female)
 
         # sex determination (if not pre-determined)
@@ -549,6 +720,33 @@ class SuperIndividual(object):
         self.age += 1
 
     def diapause0(self):
+        """Advance one timestep for a CIV/CV individual at pre-diapause
+        (``diapausestate == 0``): growth/reserve allocation
+        (:func:`~pascal.biology.growth.growthanddevelopment_dsc2`, split
+        between structural and reserve mass depending on
+        ``diapausestrategy`` and the two ``energyallocthreshold*``
+        settings), then either stage advancement (direct-development path,
+        ``diapausestrategy == 0``) or an entry into "true" vs. "active"
+        diapause (``diapausestrategy != 0``) once the reserve/structural
+        mass ratio passes ``genome.a7_diapauseentry``, chosen by
+        ``maxdepth`` against ``diapausedepththreshold0/1``
+        (:func:`~pascal.biology.vertical_migration.diapausedepthselection`).
+        Diapause entry/direct-development events are logged via
+        ``self.datalogger`` when set.
+
+        Notes
+        -----
+        The ``if self.diapausestrategy == -1: ...`` re-roll block at the
+        top of this method reads ``self.stochastic``, which is never set
+        anywhere on this class (only
+        ``self.global_settings["stochastic"]`` is) - this branch raises
+        ``AttributeError`` if it is ever reached. In practice
+        ``diapausestrategy`` is already resolved (no longer -1) by
+        :meth:`stage_10_11` before this method is called, so this appears
+        to be unreachable dead code rather than something that fires in a
+        normal run - not independently verified beyond reading the call
+        graph.
+        """
         # feeding and energy storing (diapause) stages at pre-diapause
 
         # diapause strategy definition (if undefined)
@@ -805,6 +1003,14 @@ class SuperIndividual(object):
             # end if
 
     def diapause1(self):
+        """Advance one timestep for a CIV/CV individual in diapause
+        (``diapausestate == 1``): reduced-metabolism degrowth
+        (:func:`~pascal.biology.growth.growthanddevelopment_dsc2_diapause`,
+        using ``diapausemetabolicrateadj0``/``1`` depending on
+        ``diapausemode`` set at diapause entry in :meth:`diapause0`), then
+        exit to ``diapausestate = 2`` once the fraction of reserve mass
+        consumed since diapause entry reaches ``genome.a8_diapauseexit``.
+        Logs the exit event via ``self.datalogger`` when set."""
         # feeding and energy storing (diapause) stages at diapause
         # estimation of potential degrowth and diapause metabolism
         if self.diapausemode == 0:
@@ -851,6 +1057,11 @@ class SuperIndividual(object):
         # end if
 
     def diapause2(self):
+        """Advance one timestep for a CIV/CV individual at post-diapause
+        (``diapausestate == 2``): resumed growth
+        (:meth:`apply_dsc2_growthdevel`), then advances to the next
+        developmental stage once structural mass reaches the current
+        critical molting mass (:meth:`get_currentcmm`)."""
         # feeding and energy storing (diapause) stages at post-diapause
         # determine new vertical position
         maxdistance, traveldistance = self.apply_dsc2_verticalmigration()
@@ -890,6 +1101,15 @@ class SuperIndividual(object):
         # end if
 
     def apply_dsc1_verticalmigration(self):
+        """Run active (dsc1) vertical migration for stage_3_9 individuals via
+        :func:`~pascal.biology.vertical_migration.verticalmigration_dsc1`,
+        updating ``self.zpos``/``self.zidx`` in place.
+
+        Returns
+        -------
+        maxdistance, traveldistance : float
+            Passed straight through to :func:`~pascal.biology.growth.growthanddevelopment_dsc1`.
+        """
         self.zpos, self.zidx, maxdistance, traveldistance = vm.verticalmigration_dsc1(
             temprange=self.get_profile("temperature"),
             fconrange=self.get_profile("food1concentration"),
@@ -911,6 +1131,18 @@ class SuperIndividual(object):
         return maxdistance, traveldistance
 
     def apply_dsc2_verticalmigration(self):
+        """Run energy-storing-stage (dsc2) vertical migration for
+        adult/diapause-eligible individuals via
+        :func:`~pascal.biology.vertical_migration.verticalmigration_dsc2`
+        (reserve-mass-aware, unlike dsc1), updating ``self.zpos``/
+        ``self.zidx`` in place.
+
+        Returns
+        -------
+        maxdistance, traveldistance : float
+            Passed straight through to the matching ``growthanddevelopment_dsc2*``
+            growth function.
+        """
         self.zpos, self.zidx, maxdistance, traveldistance = vm.verticalmigration_dsc2(
             temprange=self.get_profile("temperature"),
             fconrange=self.get_profile("food1concentration"),
@@ -933,6 +1165,20 @@ class SuperIndividual(object):
         return maxdistance, traveldistance
 
     def apply_dsc2_growthdevel(self, maxdistance, traveldistance):
+        """Compute feeding-stage growth via
+        :func:`~pascal.biology.growth.growthanddevelopment_dsc2`, updating
+        ``feedingrate``/``egestionrate``/``metabolicrate`` in place.
+
+        Parameters
+        ----------
+        maxdistance, traveldistance : float
+            From :meth:`apply_dsc2_verticalmigration`.
+
+        Returns
+        -------
+        float
+            Net structural/reserve growth rate for this timestep.
+        """
         self.feedingrate, currentgrowthrate, self.egestionrate, self.metabolicrate = (
             gdm.growthanddevelopment_dsc2(
                 temperature=self.get_zi("temperature"),
@@ -947,6 +1193,21 @@ class SuperIndividual(object):
         return currentgrowthrate
 
     def apply_dsc3_male_growthdevel(self, maxdistance, traveldistance):
+        """Compute non-feeding adult-male degrowth via
+        :func:`~pascal.biology.growth.growthanddevelopment_dsc3_male`,
+        updating ``feedingrate``/``egestionrate``/``metabolicrate`` in
+        place (``feedingrate`` is 0 for males - no feeding).
+
+        Parameters
+        ----------
+        maxdistance, traveldistance : float
+            From :meth:`apply_dsc2_verticalmigration`.
+
+        Returns
+        -------
+        float
+            Net (typically negative) growth rate for this timestep.
+        """
         self.feedingrate, currentgrowthrate, self.egestionrate, self.metabolicrate = (
             gdm.growthanddevelopment_dsc3_male(
                 temperature=self.get_zi("temperature"),
@@ -960,6 +1221,10 @@ class SuperIndividual(object):
         return currentgrowthrate
 
     def apply_dsc0_mortality(self):
+        """Apply non-feeding-stage (dsc0) predation/background mortality
+        via :func:`~pascal.biology.survival.mortalityrisk_dsc0`, shrinking
+        ``nvindividuals`` in place (truncated to ``int``). Called from
+        :meth:`stage_lt_2`."""
         currentmortalityrisk = sv.mortalityrisk_dsc0(
             strmass=self.structuralmass,
             maxstrmass=self.maxstructuralmass,
@@ -975,6 +1240,23 @@ class SuperIndividual(object):
         self.nvindividuals = int(self.nvindividuals * (1.0 - currentmortalityrisk))
 
     def apply_dsc1_mortality(self):
+        """Intended as feeding-stage (dsc1) predation/background mortality
+        via :func:`~pascal.biology.survival.mortalityrisk_dsc1`, mirroring
+        :meth:`apply_dsc0_mortality`/:meth:`apply_dsc2_mortality`.
+
+        Notes
+        -----
+        **Not called anywhere in this codebase** - :meth:`stage_3_9` (the
+        only stage group dsc1 mortality would apply to) computes
+        ``mortalityrisk_dsc1`` inline itself rather than calling this
+        method. It also contains two bugs that would raise an exception if
+        it were ever called: ``self.get_zi["irradiance"]`` uses subscript
+        syntax on a bound method instead of calling it
+        (``self.get_zi("irradiance")``), and ``self.gloval_settings`` is a
+        typo for ``self.global_settings``. Left as found - not fixed here,
+        since this is dead code and fixing behavior is out of scope for a
+        documentation pass.
+        """
         currentmortalityrisk = sv.mortalityrisk_dsc1(
             strmass=self.structuralmass,
             maxstrmass=self.maxstructuralmass,
@@ -989,6 +1271,15 @@ class SuperIndividual(object):
         self.nvindividuals = int(self.nvindividuals * (1.00 - currentmortalityrisk))
 
     def apply_dsc2_mortality(self):
+        """Apply energy-storing/adult-stage (dsc2) predation/background
+        mortality via :func:`~pascal.biology.survival.mortalityrisk_dsc2`,
+        shrinking ``nvindividuals`` in place (kept as ``float``, unlike
+        :meth:`apply_dsc0_mortality`/:meth:`apply_dsc1_mortality` which
+        truncate to ``int``). Called from
+        :meth:`apply_mortality_and_deathcheck` for every individual with
+        ``developmentalstage > 2`` - the vectorized equivalent used by
+        :class:`~pascal.coupler.PascalSimulation` is
+        :func:`~pascal.biology.survival.mortalityrisk_dsc2_vectorized`."""
         currentmortalityrisk = sv.mortalityrisk_dsc2(
             strmass=self.structuralmass,
             maxstrmass=self.maxstructuralmass,
@@ -1004,6 +1295,17 @@ class SuperIndividual(object):
         self.nvindividuals = self.nvindividuals * (1 - currentmortalityrisk)
 
     def get_currentcmm(self):
+        """Return this individual's current critical molting mass (CMM):
+        the structural mass threshold at which it advances to the next
+        developmental stage, interpolated between
+        ``global_settings["cmm_lower"/"cmm_upper"][developmentalstage]``
+        by its genome's ``a1_bodysize`` value (same formula as
+        ``self.adultsize``, evaluated at stage 12, in ``__init__``).
+
+        Returns
+        -------
+        float
+        """
         return (
             self.global_settings["cmm_lower"][self.developmentalstage]
             + (
@@ -1014,6 +1316,17 @@ class SuperIndividual(object):
         )
 
     def update_mass(self, currentgrowthrate):
+        """Apply a computed growth rate to structural/reserve mass:
+        positive growth always goes to structural mass; negative growth
+        (degrowth) is drawn from reserve mass first if there is enough,
+        otherwise from structural mass. Updates ``maxstructuralmass`` if
+        structural mass reaches a new high.
+
+        Parameters
+        ----------
+        currentgrowthrate : float
+            Net growth rate for this timestep (may be negative).
+        """
         if currentgrowthrate > 0:
             # if the net growth rate is positive, all the surplus assimilation is channeled to somatic growth
             # no changes in the reserve mass
@@ -1035,6 +1348,20 @@ class SuperIndividual(object):
             self.structuralmass = self.structuralmass + currentgrowthrate
 
     def get_child_genome(self):
+        """Produce one offspring genome from this (female) individual's
+        genome and its stored ``malegenome`` (set at mating time - see
+        :meth:`pascal.coupler.PascalSimulation.gene_hunt`), via per-gene
+        BLX-alpha crossover (Takahashi et al. 2001,
+        10.1109/CEC.2001.934452) and random-replacement mutation, gated by
+        ``cxthreshold``/``muthreshold``. Deterministic (no crossover/
+        mutation, plain inheritance of the female's genome) when
+        ``global_settings["stochastic"]`` is ``False``.
+
+        Returns
+        -------
+        dotdict
+            One offspring genome, same keys as ``EXPECTED_GENES``.
+        """
         spawning_f = self.genome
         spawning_m = self.malegenome
         spawning_n = dotdict()
@@ -1070,6 +1397,15 @@ class SuperIndividual(object):
         return spawning_n
 
     def get_child_origin(self):
+        """Return the ``(lon, lat)`` origin an offspring of this individual
+        should inherit - one of its two parents' origins, chosen at
+        random when ``global_settings["stochastic"]`` (else always the
+        mother's).
+
+        Returns
+        -------
+        tuple of (float, float)
+        """
         # A mating-spawned super-individual inherits its origin from one
         # of its parents (not its own current position) - see
         # prompt_improvements.txt feature 3. Chosen randomly between the
@@ -1082,6 +1418,32 @@ class SuperIndividual(object):
         return (self.origin_lon, self.origin_lat)
 
     def get_spatial_log_data(self, varlist):
+        """Return this individual's contribution to one timestep's spatial
+        output grid, for
+        :meth:`pascal.coupler.PascalSimulation.log_spatial`.
+
+        Parameters
+        ----------
+        varlist : list of str
+            Variable names to include (``pascal.data_logger.OutputLogger``'s
+            ``spatial_var_list``).
+
+        Returns
+        -------
+        col : int
+            Developmental-stage index to bin into (13 for adult males,
+            since ``developmentalstage`` alone doesn't distinguish adult
+            sex - females stay at 12).
+        zidx : int
+            Current depth-bin index.
+        out_dict : dict
+            ``{var: value}`` for each requested variable; mass/rate
+            variables (``structuralmass``, ``reservemass``,
+            ``feedingrate``, ``egestionrate``, ``metabolicrate``) are
+            scaled by ``nvindividuals`` and converted from per-individual
+            µgC to total gC (``* 1e-6``) - other variables are returned
+            as-is.
+        """
         if self.developmentalstage == 12 and self.sex == "M":
             col = 13
         else:
@@ -1105,6 +1467,33 @@ class SuperIndividual(object):
         return col, self.zidx, out_dict  # Check this is the correct Z
 
     def get_log_data(self):
+        """Return this individual's contribution to a diapause-entry/exit
+        or direct-development log event, for
+        ``pascal.data_logger.OutputLogger.add_ddev``/``add_den``/``add_dex``
+        (called from :meth:`diapause0`/:meth:`diapause1`).
+
+        Returns
+        -------
+        dict
+            ``{"individuals", "structuralmass", "reservemass"}``.
+
+        Notes
+        -----
+        **Verified bug**: ``self.tnvindividuals`` does not exist anywhere
+        on this class (the attribute is ``nvindividuals``, no leading
+        ``t``) - this raises ``AttributeError`` the first time this method
+        is actually reached (i.e. the first diapause entry/exit or
+        direct-development event in any run using a datalogger). Also note
+        ``reservemass``'s value here is computed from ``structuralmass``,
+        not ``self.reservemass`` - unclear from the code alone whether
+        that is intentional or itself a copy-paste bug; not changed here
+        since fixing behavior is out of scope for a documentation pass.
+        Separately, ``pascal.data_logger.OutputLogger.add_ddev``/
+        ``add_den``/``add_dex`` (the callers) also reference
+        ``self.current_timestep``, which is never set anywhere on
+        ``OutputLogger`` either - a second, independent bug in the same
+        code path.
+        """
         return {
             "individuals": self.nvindividuals,
             "structuralmass": (self.structuralmass * self.tnvindividuals) / 1e6,

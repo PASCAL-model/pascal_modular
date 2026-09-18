@@ -26,7 +26,8 @@ coupler.py's log_spatial/gene_hunt/respawn, which index into the tracker's
 element arrays by environment_index) once results come back. Nothing about
 individual.py's own read pattern (get_profile/get_zi) changes.
 
-Usage:
+Usage::
+
     from coupler_parallel import PascalAdvectionParallel
 
     sim = PascalAdvectionParallel(
@@ -241,7 +242,8 @@ class Pascal1DParallel(PascalSimulationParallel, Pascal1D):
 class PascalAdvectionParallel(PascalSimulationParallel, PascalAdvection):
     """Parallelized advection simulation with OpenDrift.
 
-    Example:
+    Example::
+
         sim = PascalAdvectionParallel(
             nsup_individ=1000,
             nindivid_per_sup=10000,
