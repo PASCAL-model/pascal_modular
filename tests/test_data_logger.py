@@ -112,3 +112,81 @@ def test_resolve_spatial_handles_empty_input(tmp_path):
     data_dict = {"nvindividuals": np.zeros((0,))}
     result = logger.resolve_spatial(cxyz, data_dict)
     assert result["nvindividuals"].sum() == 0
+
+
+# --- add_ddev/add_den/add_dex/write_events: regression coverage for a
+# previously entirely-dead code path (SuperIndividual never actually had a
+# datalogger reference passed to it via coupler.py's seed(), so none of
+# this had ever been exercised in a real run - see pascal_docs'
+# open_issues.md) ---
+
+
+def test_add_ddev_accumulates_at_current_timestep(tmp_path):
+    logger = make_logger(tmp_path)
+    logger.current_timestep = 2
+    logger.add_ddev({"individuals": 5.0, "structuralmass": 1.5}, col=1)
+
+    assert logger.ddev["individuals"][2, 1] == 5.0
+    assert logger.ddev["structuralmass"][2, 1] == 1.5
+    # untouched elsewhere
+    assert logger.ddev["individuals"].sum() == 5.0
+
+
+def test_add_den_and_add_dex_use_three_indices(tmp_path):
+    """den/dex are indexed (timestep, stage, mode) - a 3-index write into
+    what used to be 2D arrays (see open_issues.md); this pins the fixed
+    shape down as a regression test."""
+    logger = make_logger(tmp_path)
+    logger.current_timestep = 0
+
+    logger.add_den({"individuals": 3.0}, col1=0, col2=1)
+    assert logger.den["individuals"][0, 0, 1] == 3.0
+    assert logger.den["individuals"].shape == (5, 2, 2)
+
+    logger.add_dex({"individuals": 4.0}, col1=1, col2=0)
+    assert logger.dex["individuals"][0, 1, 0] == 4.0
+    assert logger.dex["individuals"].shape == (5, 2, 2)
+
+
+def _log_empty_spatial_timesteps(logger, n):
+    """write_spatial() expects one log_spatial() call per timestep (as a
+    real run.py's log_spatial()-every-outer-iteration would produce) -
+    empty per-timestep contributions are enough to exercise write_spatial()
+    itself without needing a full simulation."""
+    empty_cxyz = np.zeros((0, 4))
+    empty_data = {var: np.zeros((0,)) for var in logger.spatial_var_list}
+    for _ in range(n):
+        logger.log_spatial(empty_cxyz, empty_data)
+
+
+def test_write_events_writes_accumulated_data(tmp_path):
+    logger = make_logger(tmp_path)
+    _log_empty_spatial_timesteps(logger, logger.total_timesteps)
+    logger.current_timestep = 1
+    logger.add_ddev({"individuals": 10.0, "structuralmass": 2.0, "reservemass": 1.0}, col=0)
+    logger.add_den({"individuals": 7.0, "structuralmass": 3.0, "reservemass": 2.0}, col1=1, col2=0)
+    logger.add_dex({"individuals": 6.0, "structuralmass": 1.0, "reservemass": 0.5}, col1=0, col2=0)
+
+    # write_events() reopens the file write_spatial() creates, so both
+    # must run for a real end-of-run output file.
+    logger.write_spatial()
+    logger.write_events()
+
+    import netCDF4 as nc
+    with nc.Dataset(logger.outputfile, "r") as ds:
+        assert ds["ddev_individuals"][1, 0] == 10.0
+        assert ds["den_structuralmass"][1, 1, 0] == 3.0
+        assert ds["dex_reservemass"][1, 0, 0] == 0.5
+        # genome_log is written even though nothing in this codebase ever
+        # calls log_evolvable() - documented as all-zero, not an error.
+        assert ds["genome_log"][:].sum() == 0
+
+
+def test_write_spatial_devstage_coordinate_is_populated(tmp_path):
+    logger = make_logger(tmp_path, devstages=13)
+    _log_empty_spatial_timesteps(logger, logger.total_timesteps)
+    logger.write_spatial()
+
+    import netCDF4 as nc
+    with nc.Dataset(logger.outputfile, "r") as ds:
+        assert list(ds["devstage"][:]) == list(range(13))

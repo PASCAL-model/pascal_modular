@@ -247,7 +247,14 @@ class PascalSimulation(object):
         seed_locations = self.select_start_locations(self.seeding_rate)
         self.seed(self.seeding_rate, seed_locations, genome=None)
 
-        for this_step in self.all_steps:
+        for timestep_idx, this_step in enumerate(self.all_steps):
+            # self.datalogger's ddev/den/dex accumulators are pre-sized to
+            # len(self.all_steps) (see __init__) and index by this outer
+            # loop position, not by `this_step` itself (which skips ahead
+            # by timestep_isplit when isplit > 1) - SuperIndividual.diapause0/1
+            # read this via self.datalogger.add_ddev/add_den/add_dex during
+            # update_lifestage() below.
+            self.datalogger.current_timestep = timestep_idx
             self.update_environment()
             self.sync_environment_references()
             for isplit in np.arange(0, self.isplit):
@@ -577,6 +584,7 @@ class PascalSimulation(object):
                 environment_index,
                 nindividuals=self.ni_per_sup,
                 genes=genome[i],
+                datalogger=self.datalogger,
                 unique_id=self.next_unique_id,
                 origin=origins[i]
             )
@@ -686,14 +694,16 @@ class PascalSimulation(object):
     def finish_run(self):
         """Write end-of-run output to ``self.outputfolder``: debug output
         (if enabled), per-individual lifetime stats
-        (:meth:`write_lifestats`), and gridded spatial output
-        (``self.datalogger.write_spatial()``).
+        (:meth:`write_lifestats`), gridded spatial output
+        (``self.datalogger.write_spatial()``), and diapause/direct-
+        development event counters (``self.datalogger.write_events()``).
         :class:`PascalAdvection` overrides this to also finalize the
         OpenDrift tracker first."""
         if self.debug is not None:
             np.save(f'{self.outputfolder}/debug_output.npy', self.debug_output)
         self.write_lifestats()
         self.datalogger.write_spatial()
+        self.datalogger.write_events()
 
     def report(self):
         """Print a one-line colored progress report (percent complete,

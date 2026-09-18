@@ -1,10 +1,10 @@
 """Output aggregation and netCDF writing for PASCAL runs.
 
-Owns two kinds of output: gridded spatial/temporal population state
-(:meth:`OutputLogger.log_spatial`, written by :meth:`OutputLogger.write_spatial`)
-and scalar diapause/direct-development event counters
-(:meth:`OutputLogger.add_ddev`/``add_den``/``add_dex``, not currently
-written to disk anywhere - see :class:`OutputLogger`'s docstring).
+Owns two kinds of output, both written to the same ``output_ps.nc``:
+gridded spatial/temporal population state (:meth:`OutputLogger.log_spatial`,
+written by :meth:`OutputLogger.write_spatial`) and scalar diapause/
+direct-development event counters (:meth:`OutputLogger.add_ddev`/
+``add_den``/``add_dex``, written by :meth:`OutputLogger.write_events`).
 """
 
 import numpy as np
@@ -29,12 +29,15 @@ class OutputLogger(object):
     ``self.ddev``/``self.den``/``self.dex`` (direct-development and
     diapause entry/exit counters, filled by :meth:`add_ddev`/:meth:`add_den`/
     :meth:`add_dex`) and ``self.genome_log`` (filled by
-    :meth:`log_evolvable`, which is itself never called anywhere in this
-    codebase) are accumulated in memory but have no corresponding
-    ``write_*`` method - only :meth:`write_spatial` actually writes to
-    disk. ``write_evolvable`` exists as a stub (``pass``, "to be
-    implemented"). Whether this is an intentional work-in-progress or an
-    oversight is unclear from the code alone.
+    :meth:`log_evolvable`) are written by :meth:`write_events`, called
+    from :meth:`~pascal.coupler.PascalSimulation.finish_run` alongside
+    :meth:`write_spatial`. ``log_evolvable`` itself is never called
+    anywhere in this codebase, so ``genome_log`` will currently always
+    write as all-zeros - that's a separate, pre-existing gap (nothing
+    populates the evolvable-gene log, not that it fails to write) not
+    addressed here. ``write_evolvable`` exists as a stub (``pass``, "to
+    be implemented") and is unrelated to ``genome_log`` despite the
+    similar name - unclear from the code alone what it was meant for.
     """
 
     def __init__(self, outputfolder, total_timesteps, output_grid, devstages = 13, no_evolvable=8, save_spatial=DEFAULT_SAVE):
@@ -76,10 +79,10 @@ class OutputLogger(object):
         self.ddev = {'individuals':np.zeros([self.total_timesteps, 2]), 'structuralmass':np.zeros([self.total_timesteps, 2]), 'reservemass':np.zeros([self.total_timesteps, 2])}
         #this logs the numbers, structural masses and reserve masses of diapause entries (civ, cv stages including true and active diapausing individuals)
         #dimensions:<time> <civ, cv> <true, active>
-        self.den = {'individuals':np.zeros([self.total_timesteps, 2]), 'structuralmass':np.zeros([self.total_timesteps, 2]), 'reservemass':np.zeros([self.total_timesteps, 2])}
+        self.den = {'individuals':np.zeros([self.total_timesteps, 2, 2]), 'structuralmass':np.zeros([self.total_timesteps, 2, 2]), 'reservemass':np.zeros([self.total_timesteps, 2, 2])}
         #this logs the numbers, structural masses and reserve masses of diapause entries (civ, cv stages including true and active diapausing individuals)
         #dimensions:<time> <civ, cv> <true, active>
-        self.dex = {'individuals':np.zeros([self.total_timesteps, 2]), 'structuralmass':np.zeros([self.total_timesteps, 2]), 'reservemass':np.zeros([self.total_timesteps, 2])}
+        self.dex = {'individuals':np.zeros([self.total_timesteps, 2, 2]), 'structuralmass':np.zeros([self.total_timesteps, 2, 2]), 'reservemass':np.zeros([self.total_timesteps, 2, 2])}
 
         # Log the changing genomes
         self.genome_log = np.zeros([self.total_timesteps, self.no_evolvable, 2])
@@ -89,7 +92,11 @@ class OutputLogger(object):
         if not os.path.exists(outputfolder):
             os.makedirs(outputfolder)
 
-        self.outputfile = f'./{outputfolder}/output_ps.nc'
+        # os.path.join (not an f-string prefix) so this also works when
+        # outputfolder is itself an absolute path - found via testing,
+        # harmless for every current real caller (which always passes a
+        # plain relative folder name).
+        self.outputfile = os.path.join(outputfolder, 'output_ps.nc')
 
     def prep_grid(self):
         """Derive ``min/max_lon``/``min/max_lat`` and grid cell resolution
@@ -126,11 +133,9 @@ class OutputLogger(object):
 
         Notes
         -----
-        **Verified bug**: references ``self.current_timestep``, which is
-        never set anywhere on this class - calling this raises
-        ``AttributeError``. Not fixed here (see
-        :meth:`~pascal.individual.SuperIndividual.get_log_data`'s
-        docstring for the related bug in its caller).
+        ``self.current_timestep`` is set once per outer timestep by
+        :meth:`~pascal.coupler.PascalSimulation.run`, not tracked by this
+        class itself.
         """
         for var, add_data in data.items():
             self.ddev[var][self.current_timestep, col] += add_data
@@ -147,10 +152,6 @@ class OutputLogger(object):
         col2 : int
             Diapause mode (0: "true" diapause, 1: "active" diapause - see
             :meth:`~pascal.individual.SuperIndividual.diapause0`).
-
-        Notes
-        -----
-        Same ``self.current_timestep`` bug as :meth:`add_ddev`.
         """
         for var, add_data in data.items():
             self.den[var][self.current_timestep, col1, col2] += add_data
@@ -168,10 +169,6 @@ class OutputLogger(object):
             Always 0 in current call sites (see
             :meth:`~pascal.individual.SuperIndividual.diapause1`) - a
             second mode value is never passed, unlike :meth:`add_den`.
-
-        Notes
-        -----
-        Same ``self.current_timestep`` bug as :meth:`add_ddev`.
         """
         for var, add_data in data.items():
             self.dex[var][self.current_timestep, col1, col2] += add_data
@@ -305,6 +302,11 @@ class OutputLogger(object):
         stagevar = populationsize_ds.createVariable("devstage", np.int32, ("devstage", ))
         stagevar.units = "dim.less"
         stagevar.longname = "developmental stage"
+        # Position labels 0..devstages-1, matching resolve_spatial()'s own
+        # array indexing (stage_ind = stage_column - 1) - not fixed
+        # differently since interpreting the col==0 (egg) wrap-to-last-slot
+        # quirk noted there is a modelling question, not a labelling one.
+        stagevar[:] = np.arange(self.devstages)
 
         lonvar = populationsize_ds.createVariable("lon", np.float32, ("lon", ))
         lonvar.units = "degrees east"
@@ -342,6 +344,61 @@ class OutputLogger(object):
     def write_evolvable(self):
         # to be implemented
         pass
+
+    def write_events(self):
+        """Write accumulated diapause-entry/exit and direct-development
+        event counters (``self.ddev``/``self.den``/``self.dex``, filled by
+        :meth:`add_ddev`/:meth:`add_den`/:meth:`add_dex`) and the
+        evolvable-gene log (``self.genome_log``, filled by
+        :meth:`log_evolvable`) to the same ``output_ps.nc`` written by
+        :meth:`write_spatial` - which must run first, since this reopens
+        that file rather than creating it."""
+        ds = nc.Dataset(self.outputfile, "a", format="NETCDF4_CLASSIC")
+
+        ds.createDimension("ddev_col", 2)
+        ds.createDimension("diapause_stage", 2)
+        ds.createDimension("diapause_mode", 2)
+        ds.createDimension("evolvable", self.no_evolvable)
+        ds.createDimension("genome_stat", 2)
+
+        for var, data in self.ddev.items():
+            dv = ds.createVariable(f"ddev_{var}", np.float64, ("time", "ddev_col"))
+            dv.longname = (
+                f"direct-development event {var}, by (genetic, "
+                "environmental) determination"
+            )
+            dv[:] = data
+
+        for var, data in self.den.items():
+            dv = ds.createVariable(
+                f"den_{var}", np.float64, ("time", "diapause_stage", "diapause_mode")
+            )
+            dv.longname = (
+                f"diapause-entry event {var}, by (CIV, CV) stage and "
+                "(true, active) mode"
+            )
+            dv[:] = data
+
+        for var, data in self.dex.items():
+            dv = ds.createVariable(
+                f"dex_{var}", np.float64, ("time", "diapause_stage", "diapause_mode")
+            )
+            dv.longname = (
+                f"diapause-exit event {var}, by (CIV, CV) stage "
+                "(diapause_mode is always index 0 - see add_dex)"
+            )
+            dv[:] = data
+
+        genome_var = ds.createVariable(
+            "genome_log", np.float64, ("time", "evolvable", "genome_stat")
+        )
+        genome_var.longname = (
+            "evolvable-gene (mean, std) per timestep - see log_evolvable(); "
+            "all-zero unless something calls it"
+        )
+        genome_var[:] = self.genome_log
+
+        ds.close()
 
     def pad_data(self, data):
         target_shape =  (self.total_timesteps, self.devstages, len(self.output_grid['lon']), len(self.output_grid['lat']),

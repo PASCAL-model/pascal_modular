@@ -1420,27 +1420,13 @@ class SuperIndividual(object):
         Returns
         -------
         dict
-            ``{"individuals", "structuralmass", "reservemass"}``.
-
-        Notes
-        -----
-        **Verified bug**: ``self.tnvindividuals`` does not exist anywhere
-        on this class (the attribute is ``nvindividuals``, no leading
-        ``t``) - this raises ``AttributeError`` the first time this method
-        is actually reached (i.e. the first diapause entry/exit or
-        direct-development event in any run using a datalogger). Also note
-        ``reservemass``'s value here is computed from ``structuralmass``,
-        not ``self.reservemass`` - unclear from the code alone whether
-        that is intentional or itself a copy-paste bug; not changed here
-        since fixing behavior is out of scope for a documentation pass.
-        Separately, ``pascal.data_logger.OutputLogger.add_ddev``/
-        ``add_den``/``add_dex`` (the callers) also reference
-        ``self.current_timestep``, which is never set anywhere on
-        ``OutputLogger`` either - a second, independent bug in the same
-        code path.
+            ``{"individuals", "structuralmass", "reservemass"}``, each
+            scaled by ``nvindividuals`` and converted from per-individual
+            µg to gC (``1e-6``), matching :meth:`get_spatial_log_data`'s
+            convention.
         """
         return {
             "individuals": self.nvindividuals,
-            "structuralmass": (self.structuralmass * self.tnvindividuals) / 1e6,
-            "reservemass": (self.structuralmass * self.nvindividuals) / 1e6,
+            "structuralmass": (self.structuralmass * self.nvindividuals) * 1e-6,
+            "reservemass": (self.reservemass * self.nvindividuals) * 1e-6,
         }
