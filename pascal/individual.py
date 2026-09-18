@@ -734,32 +734,8 @@ class SuperIndividual(object):
         Diapause entry/direct-development events are logged via
         ``self.datalogger`` when set.
 
-        Notes
-        -----
-        The ``if self.diapausestrategy == -1: ...`` re-roll block at the
-        top of this method reads ``self.stochastic``, which is never set
-        anywhere on this class (only
-        ``self.global_settings["stochastic"]`` is) - this branch raises
-        ``AttributeError`` if it is ever reached. In practice
-        ``diapausestrategy`` is already resolved (no longer -1) by
-        :meth:`stage_10_11` before this method is called, so this appears
-        to be unreachable dead code rather than something that fires in a
-        normal run - not independently verified beyond reading the call
-        graph.
         """
         # feeding and energy storing (diapause) stages at pre-diapause
-
-        # diapause strategy definition (if undefined)
-        if self.diapausestrategy == -1:
-            if self.stochastic:
-                diapausern = np.random.rand(1).squeeze().item()
-            else:
-                diapausern = 0.5
-
-            self.diapausestrategy = (
-                0 if diapausern <= self.genome.a6_diapauseprobability else 1
-            )
-
         maxdistance, traveldistance = self.apply_dsc2_verticalmigration()
 
         # growth, development and metabolism
