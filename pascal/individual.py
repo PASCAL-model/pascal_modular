@@ -1215,37 +1215,6 @@ class SuperIndividual(object):
 
         self.nvindividuals = int(self.nvindividuals * (1.0 - currentmortalityrisk))
 
-    def apply_dsc1_mortality(self):
-        """Intended as feeding-stage (dsc1) predation/background mortality
-        via :func:`~pascal.biology.survival.mortalityrisk_dsc1`, mirroring
-        :meth:`apply_dsc0_mortality`/:meth:`apply_dsc2_mortality`.
-
-        Notes
-        -----
-        **Not called anywhere in this codebase** - :meth:`stage_3_9` (the
-        only stage group dsc1 mortality would apply to) computes
-        ``mortalityrisk_dsc1`` inline itself rather than calling this
-        method. It also contains two bugs that would raise an exception if
-        it were ever called: ``self.get_zi["irradiance"]`` uses subscript
-        syntax on a bound method instead of calling it
-        (``self.get_zi("irradiance")``), and ``self.gloval_settings`` is a
-        typo for ``self.global_settings``. Left as found - not fixed here,
-        since this is dead code and fixing behavior is out of scope for a
-        documentation pass.
-        """
-        currentmortalityrisk = sv.mortalityrisk_dsc1(
-            strmass=self.structuralmass,
-            maxstrmass=self.maxstructuralmass,
-            vpreldensity=self.get_zi("pred1dens"),
-            irradiance=self.get_zi["irradiance"],
-            maxirradiance=self.global_settings["maxirradiance"],
-            minirradiance=self.gloval_settings["minirradiance"],
-            nvpreldensity=self.global_settings["nonvisualpredatorreldensity"],
-            bgmrisk=self.global_settings["backgroundmortalityrisk"],
-        )
-
-        self.nvindividuals = int(self.nvindividuals * (1.00 - currentmortalityrisk))
-
     def apply_dsc2_mortality(self):
         """Apply energy-storing/adult-stage (dsc2) predation/background
         mortality via :func:`~pascal.biology.survival.mortalityrisk_dsc2`,
